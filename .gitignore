@@ -1,0 +1,10 @@
+/.godot/
+/美术参考/
+/*.docx
+/.agents/
+/.codex/
+/.aws/
+.env
+.env.*
+Thumbs.db
+.DS_Store

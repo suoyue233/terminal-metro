@@ -1,0 +1,7 @@
+/.godot/
+/runtime/
+/build/
+/tests/logs/
+/tests/*.png
+/tests/*save.json
+/saves/

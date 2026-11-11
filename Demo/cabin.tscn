@@ -1,0 +1,10 @@
+[gd_scene format=3 uid="uid://c4wbu56ep28b3"]
+
+[ext_resource type="Script" uid="uid://7p06x2sk4n5x" path="res://scripts/cabin.gd" id="1_qtgwc"]
+
+[node name="MetroCabin" type="Control" unique_id=1909170873]
+layout_mode = 3
+anchors_preset = 15
+anchor_right = 1.0
+anchor_bottom = 1.0
+script = ExtResource("1_qtgwc")
