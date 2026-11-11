@@ -37,7 +37,10 @@ func _get_tooltip(at: Vector2) -> String:
 	if entry.is_empty():
 		return ""
 	var shape: Vector2i = host.state.footprint(entry.kind, entry.rotated)
-	return "%s · %s · %d × %d" % [host.state.ITEMS[entry.kind].name, host.state.rarity_name(entry.kind), shape.x, shape.y]
+	var name: String = host.state.item_name(entry.kind)
+	if entry.kind == "aaa":
+		return "%s · %d%%" % [name, entry.charge]
+	return "%s · %s · %d × %d" % [name, host.state.rarity_name(entry.kind), shape.x, shape.y]
 
 func _get_drag_data(at: Vector2) -> Variant:
 	var entry: Dictionary = host.state.entry_at(container, cell_at(at))
@@ -78,16 +81,17 @@ func _draw() -> void:
 	for entry in host.state.entries(container):
 		var box: Rect2i = host.state.item_rect(entry)
 		var rect := Rect2(box.position * cell_size, box.size * cell_size).grow(-3)
-		var item: Dictionary = host.state.ITEMS[entry.kind]
 		var tint: Color = host.state.rarity_color(entry.kind)
 		var active: bool = host.selection.get("source") == container and host.selection.get("id") == entry.id
 		draw_rect(rect, tint.darkened(0.72))
 		draw_rect(rect, tint if active else tint.darkened(0.22), false, 2)
 		draw_rect(Rect2(rect.position + Vector2(4, 4), Vector2(rect.size.x - 8, 3)), tint)
-		var short_name: String = {"copper": "铜线", "tools": "工具", "book": "手册", "meds": "医疗", "circuit": "电路", "powercore": "电源", "relic": "相机"}[entry.kind]
-		var title: String = item.name if box.size.x >= 2 else short_name
+		var short_name: String = {"copper": "铜线", "tools": "工具", "book": "手册", "meds": "医疗", "circuit": "电路", "powercore": "电源", "relic": "相机", "aaa": "电池", "water": "饮水", "ration": "口粮"}[entry.kind]
+		var title: String = host.state.item_name(entry.kind) if box.size.x >= 2 else short_name
 		draw_string(host.font, rect.position + Vector2(7, 28), title, HORIZONTAL_ALIGNMENT_LEFT, -1, 15, Color("f0ebdf"))
-		if box.size.y >= 2:
+		if entry.kind == "aaa":
+			draw_string(host.font, rect.position + Vector2(7, 43), "%d%%" % entry.charge, HORIZONTAL_ALIGNMENT_LEFT, -1, 11, tint)
+		elif box.size.y >= 2:
 			draw_string(host.font, rect.end + Vector2(-39, -10), "%d×%d" % [box.size.x, box.size.y], HORIZONTAL_ALIGNMENT_LEFT, -1, 13, tint)
 	if host.selection.is_empty() or not Rect2i(Vector2i.ZERO, bounds).has_point(hover_cell):
 		return

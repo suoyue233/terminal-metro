@@ -28,8 +28,10 @@ var screen := ""
 var selection: Dictionary = {}
 var grids: Array[Control] = []
 var status: Label
+var time_label: Label
 var selected_station := ""
 var outside_tab := false
+var trade_supplies := false
 var loadout: Dictionary = {}
 var save_path: String
 var pointer_position := Vector2.ZERO
@@ -47,7 +49,16 @@ func _ready() -> void:
 			save_path = argument.trim_prefix("--save-file=")
 	var has_save := FileAccess.file_exists(save_path)
 	var loaded := state.load_cabin(save_path, Rail.STATIONS.keys())
-	show_cabin("读取存档失败，已开始新游戏。" if has_save and not loaded else "")
+	if not state.game_over_reason.is_empty():
+		show_game_over()
+	elif not FileAccess.file_exists(save_path + ".rules_seen"):
+		show_rules("读取存档失败，已开始新游戏。" if has_save and not loaded else "")
+	else:
+		show_cabin("读取存档失败，已开始新游戏。" if has_save and not loaded else "")
+
+func _process(_delta: float) -> void:
+	if screen == "surface" and not check_trip_timeout():
+		update_trip_clock()
 
 func _input(event: InputEvent) -> void:
 	if event is InputEventMouse:
@@ -68,7 +79,9 @@ func _input(event: InputEvent) -> void:
 		rotate_selection()
 	elif event.keycode == KEY_ESCAPE and screen == "news":
 		show_map()
-	elif event.keycode == KEY_ESCAPE and screen not in ["cabin", "surface"]:
+	elif event.keycode == KEY_ESCAPE and screen == "rules":
+		dismiss_rules()
+	elif event.keycode == KEY_ESCAPE and screen not in ["cabin", "surface", "game_over"]:
 		show_cabin()
 	else:
 		return
@@ -156,6 +169,7 @@ func begin_page(kind: String) -> void:
 	selection = {}
 	grids.clear()
 	status = null
+	time_label = null
 	view = Control.new()
 	view.name = kind.capitalize()
 	view.mouse_filter = MOUSE_FILTER_IGNORE
@@ -167,18 +181,40 @@ func report(message: String, color: Color = AMBER) -> void:
 		status.text = message
 		status.add_theme_color_override("font_color", color)
 
-func power(parent: Control, at: Vector2) -> void:
+func energy_text(amount: float) -> String:
+	var rounded := snappedf(amount, 0.1)
+	return str(roundi(rounded)) if is_equal_approx(rounded, roundf(rounded)) else str(rounded)
+
+func car_power_text() -> String:
+	return "%s / %d 度" % [energy_text(state.car_power), State.CAR_CAPACITY]
+
+func power(parent: Control, at: Vector2, title: String, value: String, tint: Color) -> void:
 	plate(parent, Rect2(at, Vector2(232, 64)), Color("242135"), BORDER)
-	plate(parent, Rect2(at, Vector2(3, 64)), AMBER)
-	label(parent, "电力余额", Rect2(at + Vector2(15, 0), Vector2(75, 64)), 15, MUTED)
-	label(parent, "%s Wh" % str(snappedf(state.account, 0.1)), Rect2(at + Vector2(90, 0), Vector2(127, 64)), 24, AMBER, HORIZONTAL_ALIGNMENT_RIGHT)
+	plate(parent, Rect2(at, Vector2(3, 64)), tint)
+	label(parent, title, Rect2(at + Vector2(15, 0), Vector2(75, 64)), 15, MUTED)
+	label(parent, value, Rect2(at + Vector2(84, 0), Vector2(133, 64)), 20, tint, HORIZONTAL_ALIGNMENT_RIGHT)
 
 func show_cabin(message: String = "") -> void:
 	begin_page("cabin")
 	cabin_art()
 	label(view, "终末地铁", Rect2(156, 59, 420, 60), 44)
 	label(view, "%s   /   %s   /   %s" % [state.station, state.date_text(), state.weather()], Rect2(159, 126, 560, 26), 20, MINT)
-	power(view, Vector2(889, 80))
+	power(view, Vector2(641, 80), "车内电源", car_power_text(), MINT)
+	power(view, Vector2(889, 80), "账户余额", "%s 度" % energy_text(state.account), AMBER)
+	var water := action(view, "已喝水" if state.drank_today else "喝水 · %d" % state.supply_count("water"),
+		Rect2(156, 163, 126, 33), use_supply.bind("water"))
+	water.disabled = state.drank_today
+	var ration := action(view, "已进食" if state.ate_today else "进食 · %d" % state.supply_count("ration"),
+		Rect2(294, 163, 126, 33), use_supply.bind("ration"))
+	ration.disabled = state.ate_today
+	var has_charger := state.has_charger(state.station)
+	action(view, "充电站" if has_charger else "找充电站", Rect2(432, 163, 126, 33),
+		show_charger.bind("") if has_charger else find_charger)
+	action(view, "电池充电", Rect2(570, 163, 126, 33), show_battery_charger.bind(""))
+	if state.is_blackout():
+		label(view, "今日停电", Rect2(710, 163, 105, 33), 16, AMBER)
+	if state.debt > 0.0:
+		label(view, "待还欠费  %s 度" % energy_text(state.debt), Rect2(826, 163, 294, 33), 16, AMBER, HORIZONTAL_ALIGNMENT_RIGHT)
 	label(view, "%s\n%s\n%s" % [state.station, state.date_text(), state.weather()],
 		Rect2(268, 300, 100, 73), 13, Color("322d3d"), HORIZONTAL_ALIGNMENT_CENTER)
 	for spot in HOTSPOTS:
@@ -191,13 +227,20 @@ func show_cabin(message: String = "") -> void:
 		var tag := action(view, spot[0], Rect2(Vector2(spot[2]) - Vector2(tag_width / 2.0, 0), Vector2(tag_width, 32)), use_hotspot.bind(spot[3]))
 		tag.add_theme_font_size_override("font_size", 14)
 	if not message.is_empty():
-		plate(view, Rect2(352, 647, 576, 38), Color("211f31e8"), BORDER)
-		label(view, message, Rect2(367, 647, 546, 38), 16, MINT, HORIZONTAL_ALIGNMENT_CENTER)
+		plate(view, Rect2(208, 647, 864, 38), Color("211f31e8"), BORDER)
+		label(view, message, Rect2(222, 647, 836, 38), 16, MINT, HORIZONTAL_ALIGNMENT_CENTER)
+
+func use_supply(kind: String) -> void:
+	var problem := state.consume_supply(kind)
+	var success := "今日已喝水。" if kind == "water" else "今日已进食。"
+	show_cabin(success if problem.is_empty() else problem)
 
 func use_hotspot(kind: String) -> void:
 	match kind:
 		"locker": show_locker()
-		"trade": show_trade()
+		"trade":
+			trade_supplies = false
+			show_trade()
 		"rest": show_rest()
 		"gear":
 			loadout = {"heavy": false, "wide": state.wide_bag, "light": true, "crowbar": true}
@@ -213,52 +256,209 @@ func overlay(parent: Control, color: Color) -> void:
 	blocker.mouse_filter = MOUSE_FILTER_STOP
 	put(parent, blocker, Rect2(0, 0, 1280, 720))
 
-func modal(title: String, bounds: Rect2) -> Panel:
+func modal(title: String, bounds: Rect2, on_close: Callable = Callable()) -> Panel:
 	cabin_art()
 	overlay(view, Color("0d0b16ae"))
 	var frame := plate(view, bounds, DARK, BORDER)
 	label(frame, title, Rect2(24, 13, bounds.size.x - 130, 44), 28)
-	action(frame, "关闭", Rect2(bounds.size.x - 88, 18, 64, 34), show_cabin.bind(""))
+	action(frame, "关闭", Rect2(bounds.size.x - 88, 18, 64, 34), on_close if on_close.is_valid() else show_cabin.bind(""))
 	plate(frame, Rect2(24, 66, bounds.size.x - 48, 1), BORDER)
 	return frame
 
+func show_rules(message: String) -> void:
+	begin_page("rules")
+	var panel := modal("简要规则", Rect2(302, 99, 676, 522), dismiss_rules)
+	var rules := [
+		["用电与欠费", "行车每站耗 %d 度，电脑每天耗 %d 度。充电、购物和租防护服时，余额不足可挂账。七号电池在车内充。" % [State.TRAVEL_COST_PER_STOP, State.COMPUTER_DAILY_COST]],
+		["限时拾取", "出站必带装有七号电池的手电筒。满电可拾取两件，每件扣 5 秒。阴天 30 秒，雨天和 6 至 8 月晴天 20 秒。"],
+		["超时赔偿", "超时丢失随身物品。普通防护服赔偿 300 度，加强型 500 度，余额不足记作欠费。"],
+		["每日生存", "每天喝水、进食，睡觉时结算。连续两天未喝水或欠费、连续三天未进食都会结束本轮。"],
+	]
+	for index in range(rules.size()):
+		var y := 83 + index * 89
+		label(panel, rules[index][0], Rect2(24, y, 628, 25), 18, MINT)
+		wrapped(panel, rules[index][1], Rect2(24, y + 28, 628, 53), 16, TEXT)
+	if not message.is_empty():
+		label(panel, message, Rect2(24, 440, 628, 21), 14, AMBER)
+	action(panel, "开始游戏", Rect2(24, 466, 628, 41), dismiss_rules, true)
+
+func dismiss_rules() -> void:
+	DirAccess.make_dir_recursive_absolute(save_path.get_base_dir())
+	var seen := FileAccess.open(save_path + ".rules_seen", FileAccess.WRITE)
+	if seen != null:
+		seen.store_string("seen\n")
+		seen.close()
+	show_cabin()
+
+func show_charger(message: String = "") -> void:
+	begin_page("charger")
+	var panel := modal("车辆充电 · %s" % state.station, Rect2(300, 148, 680, 424))
+	var supply := state.charger_stock(state.station)
+	var limit := state.car_charge_limit()
+	var service := "本站今日剩余 %s 度" % energy_text(supply)
+	if state.is_blackout():
+		service = "今日停电，充电站暂停。"
+	label(panel, service, Rect2(24, 85, 632, 33), 21, MINT if supply > 0 else AMBER)
+	label(panel, "车内电源  %s" % car_power_text(), Rect2(24, 132, 302, 31), 19)
+	label(panel, "账户余额  %s 度" % energy_text(state.account), Rect2(340, 132, 316, 31), 19, AMBER)
+	label(panel, "充入多少就扣多少，账户不足的部分记为欠费。",
+		Rect2(24, 180, 632, 25), 15, MUTED)
+	vehicle_charge_option(panel, "充入", 30.0, limit, Rect2(24, 223, 170, 44))
+	vehicle_charge_option(panel, "充入", 100.0, limit, Rect2(206, 223, 178, 44))
+	vehicle_charge_option(panel, "充到上限", limit, limit, Rect2(396, 223, 260, 44), true)
+	label(panel, "待还欠费  %s 度" % energy_text(state.debt), Rect2(24, 300, 410, 36), 17, AMBER)
+	action(panel, "查其他充电站", Rect2(474, 300, 182, 36), find_charger)
+	status = label(panel, "", Rect2(24, 359, 632, 32), 16, AMBER)
+	report(message)
+
+func vehicle_charge_option(parent: Control, title: String, amount: float, limit: float, bounds: Rect2, prominent: bool = false) -> void:
+	var shortfall := state.credit_shortfall(amount)
+	var caption := "%s %s 度" % [title, energy_text(amount)]
+	var enabled := amount > 0.0 and amount <= limit
+	if enabled and shortfall > 0.0:
+		caption += " · 欠 %s 度" % energy_text(shortfall)
+	var button := action(parent, caption, bounds, charge_vehicle.bind(amount), prominent)
+	button.disabled = not enabled
+
+func added_debt_note(previous_debt: float) -> String:
+	var amount := state.debt - previous_debt
+	return " · 新增欠费 %s 度" % energy_text(amount) if amount > 0.0 else ""
+
+func charge_vehicle(requested: float) -> void:
+	var previous_debt := state.debt
+	var amount := state.charge_car(requested)
+	var message := "已充入 %s 度%s" % [energy_text(amount), added_debt_note(previous_debt)]
+	show_charger(message if amount > 0.0 else "当前无法向车辆充电。")
+
+func show_battery_charger(message: String = "") -> void:
+	begin_page("battery_charger")
+	var panel := modal("电池充电 · 车内电源", Rect2(300, 126, 680, 478))
+	label(panel, "半电池补满消耗 1 度，空电池消耗 2 度。", Rect2(24, 83, 620, 27), 17, MINT)
+	charge_row(panel, "手电筒电池", State.NO_CELL, state.installed_charge, Rect2(24, 124, 609, 42))
+	var scroll := ScrollContainer.new()
+	scroll.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	put(panel, scroll, Rect2(24, 181, 632, 187))
+	var rows := VBoxContainer.new()
+	rows.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	scroll.add_child(rows)
+	var index := 0
+	for entry in state.inventory:
+		if entry.kind != "aaa":
+			continue
+		index += 1
+		var row := Control.new()
+		row.custom_minimum_size.y = 47
+		rows.add_child(row)
+		charge_row(row, "备用电池 %d" % index, entry.id, entry.charge, Rect2(0, 0, 609, 42))
+	if index == 0:
+		label(panel, "背包里没有备用电池。", Rect2(24, 184, 632, 32), 15, MUTED)
+	label(panel, "车内电源  %s" % car_power_text(), Rect2(24, 382, 632, 27), 17, AMBER)
+	status = label(panel, "", Rect2(24, 424, 632, 31), 16, AMBER)
+	report(message)
+
+func charge_row(parent: Control, title: String, id: int, charge: int, bounds: Rect2) -> void:
+	var text := "未装入" if charge == State.NO_CELL else "%d%%" % charge
+	label(parent, "%s · %s" % [title, text], Rect2(bounds.position, Vector2(330, bounds.size.y)), 16)
+	var cost := state.battery_fill_cost(charge)
+	var caption := "充满 · %s 度" % energy_text(cost) if cost > 0.0 else "充电"
+	var charge_button := action(parent, caption,
+		Rect2(bounds.position + Vector2(bounds.size.x - 158, 0), Vector2(158, bounds.size.y)), charge_battery.bind(id))
+	charge_button.disabled = cost <= 0.0 or state.car_power < cost
+
+func charge_battery(id: int) -> void:
+	var problem := state.recharge_battery(id)
+	show_battery_charger("电池已充满。" if problem.is_empty() else problem)
+
+func find_charger() -> void:
+	var routes := Rail.routes_from(state.station)
+	var nearest := ""
+	for location in routes:
+		if location == state.station or not state.has_charger(location):
+			continue
+		if nearest.is_empty():
+			nearest = location
+		var travel_cost: int = (routes[location].size() - 1) * State.TRAVEL_COST_PER_STOP
+		if state.charger_stock(location) > 0.0 and state.car_power >= travel_cost:
+			open_market_map(location)
+			return
+	if not nearest.is_empty():
+		open_market_map(nearest)
+
 func show_rest() -> void:
 	begin_page("rest")
-	var panel := modal("休息与存档", Rect2(372, 230, 536, 256))
+	var panel := modal("休息与存档", Rect2(340, 180, 600, 360))
 	label(panel, "醒来日期   %s" % state.date_text(1), Rect2(24, 85, 480, 34), 20, MINT)
-	label(panel, "保存站点、电力余额、背包和柜内物品。", Rect2(24, 126, 480, 26), 16, MUTED)
-	status = label(panel, "", Rect2(24, 161, 488, 24), 15, AMBER)
-	action(panel, "睡到下一天并保存", Rect2(24, 194, 488, 40), sleep_and_save, true)
+	var after := state.survival_after_day()
+	label(panel, "今日饮水 · %s     结算后连续未喝 %d / 2 天" % ["已喝" if state.drank_today else "未喝", after.days_without_water],
+		Rect2(24, 129, 552, 26), 16, MUTED)
+	label(panel, "今日进食 · %s     结算后连续未吃 %d / 3 天" % ["已吃" if state.ate_today else "未吃", after.days_without_food],
+		Rect2(24, 163, 552, 26), 16, MUTED)
+	label(panel, "待还欠费 %s 度     结算后连续欠费 %d / 2 天" % [energy_text(state.debt), after.days_in_debt],
+		Rect2(24, 197, 552, 26), 16, MUTED)
+	label(panel, "电脑每日耗电 %d 度     结算后车内剩余 %s 度" % [State.COMPUTER_DAILY_COST, energy_text(state.overnight_power())],
+		Rect2(24, 231, 552, 26), 16, MUTED)
+	status = label(panel, "", Rect2(24, 259, 552, 26), 15, AMBER)
+	report("今晚结算会结束本轮。" if not after.game_over_reason.is_empty() else "")
+	action(panel, "睡到下一天并保存", Rect2(24, 290, 552, 43), sleep_and_save, true)
 
 func sleep_and_save() -> void:
 	var err := state.save_next_day(save_path)
 	if err == OK:
-		show_cabin("已保存 · %s" % state.date_text())
+		if state.game_over_reason.is_empty():
+			show_cabin("已保存 · %s" % state.date_text())
+		else:
+			show_game_over()
 	else:
 		report("存档写入失败（%s）。" % error_string(err))
+
+func show_game_over() -> void:
+	begin_page("game_over")
+	cabin_art()
+	overlay(view, Color("0d0b16c9"))
+	var panel := plate(view, Rect2(340, 205, 600, 310), DARK, BORDER)
+	label(panel, "游戏结束", Rect2(28, 23, 544, 52), 34)
+	wrapped(panel, state.game_over_reason, Rect2(28, 91, 544, 81), 22, AMBER)
+	status = label(panel, "", Rect2(28, 193, 544, 28), 15, AMBER)
+	action(panel, "开始新游戏", Rect2(28, 241, 544, 43), restart_game, true)
+
+func restart_game() -> void:
+	var fresh := State.new()
+	var err := fresh.save_current(save_path)
+	if err != OK:
+		report("新存档写入失败（%s）。" % error_string(err))
+		return
+	state = fresh
+	show_cabin()
 
 func show_trade(message: String = "") -> void:
 	begin_page("trade")
 	var market := State.Markets.profile(state.station)
 	var panel := modal("%s · %s" % [market.name, state.station], Rect2(154, 93, 972, 534))
-	label(panel, "本站供应", Rect2(24, 82, 405, 34), 21)
+	action(panel, "本站货物", Rect2(24, 82, 126, 34), set_trade_supplies.bind(false), not trade_supplies)
+	action(panel, "生活补给", Rect2(162, 82, 126, 34), set_trade_supplies.bind(true), trade_supplies)
 	label(panel, "出售背包物品", Rect2(487, 82, 450, 34), 21)
 	plate(panel, Rect2(463, 91, 1, 302), BORDER)
 	var row := 0
-	for kind in market.stock:
-		var info: Dictionary = State.ITEMS[kind]
+	var stock: Dictionary = State.Markets.ESSENTIALS if trade_supplies else market.stock
+	for kind in stock:
 		var offer := state.market_offer("stock", kind)
 		var shape := state.footprint(kind)
 		var y := 129 + row * 59
-		label(panel, info.name, Rect2(24, y, 255, 23), 17, state.rarity_color(kind))
-		var detail := "%s · %d×%d 格 · 库存 %d" % [state.rarity_name(kind), shape.x, shape.y, offer.remaining]
+		label(panel, state.item_name(kind), Rect2(24, y, 255, 23), 17, state.rarity_color(kind))
+		var descriptor := "满电 · 停电涨价" if kind == "aaa" and state.is_blackout() else "满电" if kind == "aaa" else state.rarity_name(kind)
+		var detail := "%s · %d×%d 格 · 库存 %d" % [descriptor, shape.x, shape.y, offer.remaining]
 		label(panel, detail, Rect2(24, y + 23, 255, 21), 13, MUTED)
-		var caption := "购买  %s Wh" % str(offer.price) if offer.remaining > 0 else "今日售罄"
+		var shortfall := state.credit_shortfall(offer.price)
+		var method := "赊购" if shortfall > 0.0 else "购买"
+		var caption := "%s  %s 度" % [method, energy_text(offer.price)] if offer.remaining > 0 else "今日售罄"
 		var buy := action(panel, caption, Rect2(274, y + 2, 162, 42), buy_item.bind(kind))
-		buy.disabled = offer.remaining == 0 or state.account < offer.price
+		buy.disabled = offer.remaining == 0
+		if shortfall > 0.0 and not buy.disabled:
+			buy.tooltip_text = "本次记入欠费 %s 度" % energy_text(shortfall)
 		row += 1
 	plate(panel, Rect2(24, 400, 924, 1), BORDER)
-	label(panel, "电力余额   %s Wh" % str(snappedf(state.account, 0.1)), Rect2(24, 419, 410, 36), 21, AMBER)
+	label(panel, "账户余额 %s 度    待还欠费 %s 度" % [energy_text(state.account), energy_text(state.debt)],
+		Rect2(24, 419, 680, 36), 19, AMBER)
 	action(panel, "去线路图查报价", Rect2(765, 419, 183, 37), open_market_map.bind(state.station))
 	status = label(panel, "", Rect2(24, 473, 924, 32), 16, AMBER)
 	report(message)
@@ -278,22 +478,37 @@ func show_trade(message: String = "") -> void:
 		item_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		item_row.custom_minimum_size.y = 57
 		rows.add_child(item_row)
-		label(item_row, State.ITEMS[kind].name, Rect2(0, 6, 255, 23), 17, state.rarity_color(kind))
+		label(item_row, state.item_name(kind), Rect2(0, 6, 255, 23), 17, state.rarity_color(kind))
 		var detail := "本站不收" if offer.is_empty() else "今日已满额"
 		if not offer.is_empty() and offer.remaining > 0:
 			detail = "今日还能收 %d 件" % offer.remaining
-			action(item_row, "出售  %s Wh" % str(offer.price), Rect2(267, 7, 174, 40), sell_item.bind(entry.id))
-		else:
+			action(item_row, "出售  %s 度" % str(offer.price), Rect2(267, 7, 174, 40), sell_item.bind(entry.id))
+		elif not State.Markets.ESSENTIALS.has(kind):
 			action(item_row, "查附近买家", Rect2(267, 7, 174, 40), find_buyer.bind(kind))
+		else:
+			detail = "电量 %d%%" % entry.charge if kind == "aaa" else "每日补给"
 		label(item_row, "%s · %s" % [state.rarity_name(kind), detail], Rect2(0, 28, 255, 20), 13, MUTED)
 
+func set_trade_supplies(enabled: bool) -> void:
+	trade_supplies = enabled
+	show_trade()
+
 func buy_item(kind: String) -> void:
+	var previous_debt := state.debt
 	var problem := state.purchase(kind)
-	show_trade("已购买 %s，放入背包。" % State.ITEMS[kind].name if problem.is_empty() else problem)
+	var message := "已购买 %s，放入背包%s" % [state.item_name(kind), added_debt_note(previous_debt)]
+	show_trade(message if problem.is_empty() else problem)
 
 func sell_item(id: int) -> void:
+	var old_debt := state.debt
 	var amount := state.sell(id)
-	show_trade("到账  +%s Wh" % str(amount) if amount > 0 else "当前无法出售，请查看本站收购范围和额度。")
+	var payment := snappedf(old_debt - state.debt, 0.1)
+	if amount <= 0:
+		show_trade("当前无法出售，请查看本站收购范围和额度。")
+	elif payment > 0:
+		show_trade("成交 %s 度 · 偿还欠费 %s 度" % [str(amount), str(payment)])
+	else:
+		show_trade("到账  +%s 度" % str(amount))
 
 func open_market_map(location: String) -> void:
 	selected_station = location
@@ -315,7 +530,7 @@ func find_buyer(kind: String) -> void:
 			best_distance = distance
 			best_price = offer.price
 	if destination.is_empty():
-		report("今天没有仍可收购 %s 的站点。" % State.ITEMS[kind].name)
+		report("今天没有仍可收购 %s 的站点。" % state.item_name(kind))
 	else:
 		open_market_map(destination)
 
@@ -323,13 +538,13 @@ func show_news() -> void:
 	show_map()
 	screen = "news"
 	overlay(view, Color("141021bb"))
-	var card := plate(view, Rect2(338, 192, 604, 330), Color("2c253b"), Color("746582"))
+	var card := plate(view, Rect2(318, 173, 644, 372), Color("2c253b"), Color("746582"))
 	label(card, "当日新闻", Rect2(28, 20, 430, 48), 30)
-	action(card, "关闭", Rect2(510, 25, 66, 36), show_map)
+	action(card, "关闭", Rect2(550, 25, 66, 36), show_map)
 	label(card, "%s    地面天气 · %s" % [state.date_text(), state.weather()], Rect2(28, 75, 522, 25), 16, MINT)
-	plate(card, Rect2(28, 113, 548, 1), BORDER)
-	wrapped(card, state.news(), Rect2(28, 138, 542, 78), 23)
-	action(card, "关闭并查看线路图", Rect2(28, 251, 548, 47), show_map, true)
+	plate(card, Rect2(28, 113, 588, 1), BORDER)
+	wrapped(card, state.news(), Rect2(28, 138, 588, 123), 21)
+	action(card, "关闭并查看线路图", Rect2(28, 293, 588, 47), show_map, true)
 
 func show_map() -> void:
 	begin_page("map")
@@ -356,7 +571,7 @@ func show_map() -> void:
 	if selected_station.is_empty():
 		label(detail, "选择目的地", Rect2(20, 60, 280, 39), 26)
 		wrapped(detail, "点击线路图上的站点查看站内设施、周边遗址和行车耗电。", Rect2(20, 125, 272, 92), 17, MUTED)
-		label(detail, "电力余额  %s Wh" % str(snappedf(state.account, 0.1)), Rect2(20, 469, 275, 32), 17, AMBER)
+		label(detail, "车内电源  %s" % car_power_text(), Rect2(20, 469, 275, 32), 17, MINT)
 		return
 	label(detail, selected_station, Rect2(20, 49, 280, 43), 29)
 	var lines := PackedStringArray()
@@ -375,24 +590,28 @@ func show_map() -> void:
 	plate(detail, Rect2(20, 333, 277, 1), BORDER)
 	var path := Rail.route(state.station, selected_station)
 	var steps := maxi(0, path.size() - 1)
-	var fare := steps * 10
+	var fare := steps * State.TRAVEL_COST_PER_STOP
 	label(detail, "行车路线 · %d 站" % steps, Rect2(20, 345, 275, 27), 16, MINT)
 	var itinerary := "  →  ".join(PackedStringArray(path))
 	wrapped(detail, itinerary, Rect2(20, 382, 276, 103), 14, MUTED)
-	label(detail, "电力余额  %s Wh" % str(snappedf(state.account, 0.1)), Rect2(20, 485, 275, 27), 17, AMBER)
-	var caption := "前往 · %d Wh" % fare
+	label(detail, "车内电源  %s" % car_power_text(), Rect2(20, 485, 275, 27), 17, MINT)
+	var caption := "前往 · 耗电 %d 度" % fare
 	if steps == 0:
 		caption = "已在本站" if selected_station == state.station else "线路未接通"
-	elif state.account < fare:
-		caption = "余额不足 · 需 %d Wh" % fare
+	elif state.car_power < fare:
+		caption = "车电不足 · 需 %d 度" % fare
 	var go := action(detail, caption, Rect2(20, 523, 277, 43), travel, true)
-	go.disabled = steps == 0 or state.account < fare
+	go.disabled = steps == 0 or state.car_power < fare
 
 func show_map_market(detail: Control, location: String) -> void:
 	var market := State.Markets.profile(location)
 	label(detail, market.facility, Rect2(20, 183, 277, 26), 16, MINT)
-	map_quote_column(detail, location, market.stock, "stock", 20, "本站供应 / Wh", "售罄")
-	map_quote_column(detail, location, market.demand, "demand", 162, "本站收购 / Wh", "满额")
+	if state.has_charger(location):
+		var stock := state.charger_stock(location)
+		var service := "充电站停电" if state.is_blackout() else "电站余 %s 度" % energy_text(stock)
+		label(detail, service, Rect2(181, 183, 116, 26), 13, MINT if stock > 0 else AMBER, HORIZONTAL_ALIGNMENT_RIGHT)
+	map_quote_column(detail, location, market.stock, "stock", 20, "本站供应 / 度", "售罄")
+	map_quote_column(detail, location, market.demand, "demand", 162, "本站收购 / 度", "满额")
 
 func map_quote_column(detail: Control, location: String, items: Dictionary, side: String, x: float, title: String, exhausted: String) -> void:
 	label(detail, title, Rect2(x, 210, 135, 21), 13, MUTED)
@@ -400,7 +619,7 @@ func map_quote_column(detail: Control, location: String, items: Dictionary, side
 	for kind in items:
 		var offer := state.market_offer(side, kind, location)
 		var y := 232 + row * 22
-		label(detail, State.ITEMS[kind].name, Rect2(x, y, 81, 20), 12, state.rarity_color(kind))
+		label(detail, state.item_name(kind), Rect2(x, y, 81, 20), 12, state.rarity_color(kind))
 		var price := str(offer.price) if offer.remaining > 0 else exhausted
 		label(detail, price, Rect2(x + 81, y, 54, 20), 12, TEXT if offer.remaining > 0 else MUTED, HORIZONTAL_ALIGNMENT_RIGHT)
 		row += 1
@@ -415,13 +634,9 @@ func set_map_tab(outside: bool) -> void:
 	show_map()
 
 func travel() -> void:
-	var path := Rail.route(state.station, selected_station)
-	var fare := (path.size() - 1) * 10
-	if fare <= 0 or state.account < fare:
-		return
-	state.account -= fare
-	state.station = selected_station
-	show_cabin("已抵达 %s · 消耗 %d Wh" % [state.station, fare])
+	var steps := Rail.route(state.station, selected_station).size() - 1
+	if state.travel_to(selected_station, steps):
+		show_cabin("已抵达 %s · 消耗车内电源 %d 度" % [state.station, steps * State.TRAVEL_COST_PER_STOP])
 
 func add_grid(parent: Control, target: String, at: Vector2, pixels: int) -> void:
 	var grid := CargoGrid.new()
@@ -454,6 +669,13 @@ func click_cell(target: String, cell: Vector2i) -> void:
 		select_cargo(target, entry.id)
 
 func select_cargo(source: String, id: int) -> void:
+	if check_trip_timeout():
+		return
+	if source == "ground":
+		var problem := state.pickup_problem()
+		if not problem.is_empty():
+			report(problem)
+			return
 	var entry := state.picked(source, id)
 	if entry.is_empty():
 		return
@@ -473,7 +695,7 @@ func rotate_selection() -> void:
 func update_cargo_preview() -> void:
 	var entry := state.picked(selection.source, selection.id)
 	var shape := state.footprint(entry.kind, selection.rotated)
-	report("已选 %s · %s · %d × %d" % [State.ITEMS[entry.kind].name, state.rarity_name(entry.kind), shape.x, shape.y], state.rarity_color(entry.kind))
+	report("已选 %s · %s · %d × %d" % [state.item_name(entry.kind), state.rarity_name(entry.kind), shape.x, shape.y], state.rarity_color(entry.kind))
 	for grid in grids:
 		grid.queue_redraw()
 
@@ -484,20 +706,23 @@ func drag_preview() -> Control:
 	ghost.mouse_filter = Control.MOUSE_FILTER_IGNORE
 	var tint := state.rarity_color(entry.kind)
 	ghost.add_theme_stylebox_override("panel", style(Color("322d45ee"), tint))
-	label(ghost, State.ITEMS[entry.kind].name, Rect2(8, 0, 134, 36), 15, tint)
+	label(ghost, state.item_name(entry.kind), Rect2(8, 0, 134, 36), 15, tint)
 	return ghost
 
 func move_cargo(target: String, cell: Vector2i) -> void:
-	if selection.is_empty():
+	if check_trip_timeout() or selection.is_empty():
 		return
 	var entry := state.picked(selection.source, selection.id)
 	if entry.is_empty():
 		clear_selection()
 		return
 	if not state.place(selection, target, cell):
-		report("放不下。试试空位、旋转，或重新摆放其他物品。")
+		var problem := state.pickup_problem() if selection.source == "ground" else ""
+		report("放不下。试试空位、旋转，或重新摆放其他物品。" if problem.is_empty() else problem)
 		return
-	var message := "%s 已放入%s。" % [State.ITEMS[entry.kind].name, "柜子" if target == "locker" else "背包"]
+	if check_trip_timeout():
+		return
+	var message := "%s 已放入%s。" % [state.item_name(entry.kind), "柜子" if target == "locker" else "背包"]
 	if screen == "locker":
 		show_locker(message)
 	else:
@@ -507,34 +732,59 @@ func show_gear(message: String = "") -> void:
 	begin_page("gear")
 	var panel := modal("出站整备 · %s" % state.station, Rect2(150, 106, 980, 510))
 	var radiation: int = Rail.station_info(state.station).radiation
-	label(panel, "区域辐射 · %s" % RADIATION[radiation], Rect2(24, 83, 320, 28), 17, AMBER)
+	label(panel, "区域辐射 · %s   /   外出上限 %d 秒" % [RADIATION[radiation], state.trip_limit()], Rect2(24, 83, 530, 28), 17, AMBER)
 	label(panel, "防护服租用", Rect2(24, 133, 260, 30), 20)
 	label(panel, "携带装备", Rect2(360, 133, 260, 30), 20)
 	label(panel, "背包规格", Rect2(692, 133, 260, 30), 20)
-	action(panel, "普通防护服    12 Wh", Rect2(24, 178, 263, 48), choose_gear.bind("heavy", false), not loadout.heavy)
-	action(panel, "加强防护服    30 Wh", Rect2(24, 236, 263, 48), choose_gear.bind("heavy", true), loadout.heavy)
-	wrapped(panel, "高辐射区需租用加强防护服。", Rect2(24, 308, 263, 49), 15, MUTED)
-	action(panel, "手电筒   %s" % ("已携带" if loadout.light else "未携带"), Rect2(360, 178, 263, 48), choose_gear.bind("light", not loadout.light), loadout.light)
-	action(panel, "撬棍   %s" % ("已携带" if loadout.crowbar else "未携带"), Rect2(360, 236, 263, 48), choose_gear.bind("crowbar", not loadout.crowbar), loadout.crowbar)
-	wrapped(panel, "手电照亮暗处物资。撬棍打开卡住的物资箱。", Rect2(360, 308, 263, 62), 15, MUTED)
+	action(panel, "普通防护服    %d 度" % state.suit_rent(false), Rect2(24, 178, 263, 48), choose_gear.bind("heavy", false), not loadout.heavy)
+	action(panel, "加强防护服    %d 度" % state.suit_rent(true), Rect2(24, 236, 263, 48), choose_gear.bind("heavy", true), loadout.heavy)
+	wrapped(panel, "超时赔偿普通 300 度、加强 500 度。高辐射区需加强防护服。", Rect2(24, 305, 263, 62), 15, MUTED)
+	label(panel, "手电筒必带 · %s" % installed_battery_text(), Rect2(360, 176, 263, 26), 17, MINT)
+	swap_button(panel, Rect2(360, 211, 263, 39))
+	action(panel, "撬棍   %s" % ("已携带" if loadout.crowbar else "未携带"), Rect2(360, 259, 263, 40), choose_gear.bind("crowbar", not loadout.crowbar), loadout.crowbar)
+	wrapped(panel, "一节满电电池可拾取两件物品。每件消耗半节电量和 5 秒。", Rect2(360, 310, 263, 63), 15, MUTED)
 	action(panel, "小背包    5 × 4", Rect2(692, 178, 263, 48), choose_gear.bind("wide", false), not loadout.wide)
 	action(panel, "大背包    6 × 5", Rect2(692, 236, 263, 48), choose_gear.bind("wide", true), loadout.wide)
 	wrapped(panel, "出发前可在柜子里腾出空间。", Rect2(692, 308, 263, 49), 15, MUTED)
 	plate(panel, Rect2(24, 385, 932, 1), BORDER)
-	label(panel, "电力余额  %s Wh" % str(snappedf(state.account, 0.1)), Rect2(24, 429, 247, 44), 19, AMBER)
+	label(panel, "电力余额  %s 度" % str(snappedf(state.account, 0.1)), Rect2(24, 429, 247, 44), 19, AMBER)
 	status = label(panel, "", Rect2(280, 421, 405, 60), 15, AMBER)
 	status.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	report(message)
-	action(panel, "确认出发 · %d Wh" % (30 if loadout.heavy else 12), Rect2(700, 427, 256, 46), confirm_departure, true)
+	var rent := state.suit_rent(loadout.heavy)
+	var shortfall := state.credit_shortfall(rent)
+	var caption := "确认出发 · %d 度" % rent
+	if shortfall > 0.0:
+		caption += " · 欠 %s 度" % energy_text(shortfall)
+	action(panel, caption, Rect2(700, 427, 256, 46), confirm_departure, true)
+
+func installed_battery_text() -> String:
+	return "未装七号电池" if state.installed_charge == State.NO_CELL else "%d%%" % state.installed_charge
+
+func swap_button(parent: Control, bounds: Rect2) -> void:
+	var button := action(parent, "更换电池 · 可用备用 %d" % state.usable_spares(), bounds, swap_battery)
+	button.disabled = state.spare_battery().is_empty()
+
+func swap_battery() -> void:
+	if check_trip_timeout():
+		return
+	var problem := state.replace_battery()
+	var message := "已更换七号电池 · %s。" % installed_battery_text() if problem.is_empty() else problem
+	if screen == "surface":
+		show_surface(message)
+	else:
+		show_gear(message)
 
 func choose_gear(key: String, enabled: bool) -> void:
 	loadout[key] = enabled
 	show_gear()
 
 func confirm_departure() -> void:
+	var previous_debt := state.debt
 	var problem := state.depart(loadout, Rail.station_info(state.station).radiation)
 	if problem.is_empty():
-		show_surface()
+		var debt_note := added_debt_note(previous_debt)
+		show_surface("防护服已租用" + debt_note if not debt_note.is_empty() else "")
 	else:
 		report(problem)
 
@@ -543,6 +793,8 @@ func show_surface(message: String = "") -> void:
 	overlay(view, Color("191827"))
 	label(view, "%s · 地表" % state.station, Rect2(40, 24, 560, 46), 34)
 	label(view, "辐射 · %s   /   防护服 · %s" % [RADIATION[Rail.station_info(state.station).radiation], "加强" if state.gear.heavy else "普通"], Rect2(43, 73, 560, 25), 16, MINT)
+	time_label = label(view, "", Rect2(877, 31, 220, 41), 25, AMBER, HORIZONTAL_ALIGNMENT_RIGHT)
+	update_trip_clock()
 	action(view, "返回车厢", Rect2(1119, 32, 121, 41), return_to_cabin)
 	var landscape := SurfaceScenery.new()
 	landscape.mouse_filter = Control.MOUSE_FILTER_IGNORE
@@ -551,39 +803,61 @@ func show_surface(message: String = "") -> void:
 		var kind := state.ground_kind(id)
 		if kind.is_empty():
 			continue
-		var item: Dictionary = State.ITEMS[kind]
+		var name := state.item_name(kind)
 		var dims := state.footprint(kind)
 		var anchor: Vector2 = LOOT_SPOTS[id]
 		var tint := state.rarity_color(kind)
 		var prop := plate(landscape, Rect2(anchor - Vector2(14, -7), Vector2(28, 15)), tint, Color("211d29"))
 		plate(prop, Rect2(5, 3, 14, 3), tint.lightened(0.4))
-		var hotspot := action(landscape, item.name, Rect2(anchor - Vector2(68, 34), Vector2(136, 34)), select_cargo.bind("ground", id))
+		var hotspot := action(landscape, name, Rect2(anchor - Vector2(68, 34), Vector2(136, 34)), select_cargo.bind("ground", id))
 		hotspot.tooltip_text = "%s · %d × %d 格" % [state.rarity_name(kind), dims.x, dims.y]
 		hotspot.add_theme_font_size_override("font_size", 14)
 		hotspot.add_theme_color_override("font_color", tint)
 		hotspot.set_drag_forwarding(ground_drag.bind(hotspot, id), Callable(), Callable())
 		var sprite_hit := invisible_action(landscape, prop.get_rect().grow(4), select_cargo.bind("ground", id))
-		sprite_hit.tooltip_text = "%s · %s" % [item.name, hotspot.tooltip_text]
+		sprite_hit.tooltip_text = "%s · %s" % [name, hotspot.tooltip_text]
 		sprite_hit.set_drag_forwarding(ground_drag.bind(sprite_hit, id), Callable(), Callable())
 	var sidebar := plate(view, Rect2(836, 112, 404, 524), DARK, BORDER)
 	label(sidebar, cargo_title("bag"), Rect2(24, 17, 354, 33), 22)
 	add_grid(sidebar, "bag", Vector2(24, 67), 54)
-	wrapped(sidebar, "点选或拖动物品到背包格子。\n滚轮或 R 旋转，右键取消。", Rect2(24, 354, 352, 67), 16, MUTED)
-	var equipped := "手电 %s   /   撬棍 %s" % ["已携带" if state.gear.light else "未携带", "已携带" if state.gear.crowbar else "未携带"]
-	label(sidebar, equipped, Rect2(24, 430, 354, 27), 15, MINT)
+	var pickups := floori(state.installed_charge / float(State.PICKUP_CHARGE))
+	var light_color := MINT if pickups > 0 else AMBER
+	var light_text := "手电筒 %s" % installed_battery_text()
+	light_text += " · 还能拾取 %d 件" % pickups if pickups > 0 else " · 请更换电池"
+	label(sidebar, light_text, Rect2(24, 347, 354, 26), 16, light_color)
+	swap_button(sidebar, Rect2(24, 379, 354, 38))
+	wrapped(sidebar, "点选或拖动物品到背包格子。\n滚轮或 R 旋转，拾取扣 5 秒。", Rect2(24, 428, 352, 66), 15, MUTED)
 	status = label(view, "", Rect2(42, 647, 1190, 33), 16, AMBER)
 	report(message)
 
 func ground_drag(_at: Vector2, node: Control, id: int) -> Variant:
 	select_cargo("ground", id)
-	if selection.is_empty():
+	if selection.get("source") != "ground" or selection.get("id") != id:
 		return null
 	node.set_drag_preview(drag_preview())
 	return selection
 
 func return_to_cabin() -> void:
-	state.trip_active = false
+	if check_trip_timeout():
+		return
+	state.end_trip()
 	show_cabin("已返回 %s。" % state.station)
+
+func update_trip_clock() -> void:
+	var seconds := ceili(state.remaining_ms() / 1000.0)
+	var caption := "剩余 %d 秒" % seconds
+	if time_label.text == caption:
+		return
+	time_label.text = caption
+	time_label.add_theme_color_override("font_color", Color("ff9188") if seconds <= 5 else AMBER)
+
+func check_trip_timeout() -> bool:
+	if not state.trip_active or state.remaining_ms() > 0:
+		return false
+	var fee := state.fail_trip()
+	var debt_text := " · 尚欠 %s 度" % str(state.debt) if state.debt > 0.0 else ""
+	show_cabin("外出超时 · 携带物品全部丢失 · 防护服赔偿 %d 度%s" % [fee, debt_text])
+	return true
 
 class SurfaceScenery extends Control:
 	func _draw() -> void:
