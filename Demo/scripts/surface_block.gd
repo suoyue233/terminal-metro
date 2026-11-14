@@ -56,6 +56,7 @@ const LOOT := [
 	{"x": 1495.0, "row": MIDDLE, "building": "tower", "floor": 1},
 	{"x": 1361.0, "row": SOUTH, "building": "repair", "floor": 0},
 	{"x": 1265.0, "row": NORTH, "building": "campus_shop", "floor": 0},
+	{"x": 272.0, "row": SOUTH, "building": "", "floor": 0},
 ]
 const VEHICLES := [
 	{"id": "dorm_sedan", "row": SOUTH, "x": 535.0, "color": Color("846268")},

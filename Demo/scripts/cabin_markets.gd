@@ -2,6 +2,7 @@ extends RefCounted
 ## Quote entries contain the base price in kWh and the per-station daily limit.
 
 const ESSENTIALS := {"aaa": [12.0, 5], "water": [6.0, 3], "ration": [8.0, 3]}
+const BATTERY_BUYBACK := {"aaa": [8.0, 5]}
 const CHARGERS := [
 	"邮电新村", "四平路", "海伦路", "江浦路", "大连路", "上海火车站", "汉中路",
 	"人民广场", "世纪大道", "西藏南路", "虹桥路", "龙阳路", "龙华中路", "宁国路",
@@ -70,3 +71,6 @@ static func profile(station: String) -> Dictionary:
 		if station in STATION_GROUPS[group]:
 			return PROFILES[group]
 	return PROFILES.community
+
+static func demand(station: String) -> Dictionary:
+	return BATTERY_BUYBACK.merged(profile(station).demand)

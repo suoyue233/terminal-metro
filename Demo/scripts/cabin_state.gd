@@ -318,15 +318,20 @@ func salvage_vehicle_part(vehicle_id: String, kind: String) -> String:
 	collected[vehicle_key] = taken
 	return ""
 
-func market_offer(side: String, kind: String, location: String = "") -> Dictionary:
+func market_offer(side: String, kind: String, location: String = "", charge: int = FULL_CHARGE) -> Dictionary:
 	var market_station := station if location.is_empty() else location
-	var profile := Markets.profile(market_station)
-	var catalog: Dictionary = Markets.ESSENTIALS if side == "stock" and Markets.ESSENTIALS.has(kind) else profile[side]
+	var catalog: Dictionary
+	if side == "stock":
+		catalog = Markets.ESSENTIALS if Markets.ESSENTIALS.has(kind) else Markets.profile(market_station).stock
+	else:
+		catalog = Markets.demand(market_station)
 	var terms: Array = catalog.get(kind, [])
 	if terms.is_empty():
 		return {}
 	var used: int = market_usage.get(market_key(market_station, side, kind), 0)
 	var multiplier := 1.5 if kind == "aaa" and is_blackout() else market_multiplier(kind)
+	if side == "demand" and kind == "aaa":
+		multiplier *= lerpf(0.5, 1.0, float(charge) / FULL_CHARGE)
 	return {
 		"price": snappedf(float(terms[0]) * multiplier, 0.1),
 		"remaining": maxi(0, int(terms[1]) - used),
@@ -350,7 +355,7 @@ func sell(id: int) -> float:
 	var entry := find_entry("bag", id)
 	if trip_active or entry.is_empty() or not game_over_reason.is_empty():
 		return 0.0
-	var offer := market_offer("demand", entry.kind)
+	var offer := market_offer("demand", entry.kind, station, int(entry.get("charge", FULL_CHARGE)))
 	if offer.is_empty() or offer.remaining == 0:
 		return 0.0
 	var paid: float = offer.price
@@ -545,6 +550,7 @@ func depart(loadout: Dictionary, radiation: int, loot_station: String = "") -> S
 	trip_loot = roll_loot(loot_radiation, gear.crowbar, trip_loot_station)
 	if not loot_station.is_empty():
 		trip_loot.append_array(["book", "copper", "tools", "book"])
+	trip_loot.append("aaa")
 	wide_bag = loadout.wide
 	trip_active = true
 	trip_deadline_ms = Time.get_ticks_msec() + trip_limit() * 1000

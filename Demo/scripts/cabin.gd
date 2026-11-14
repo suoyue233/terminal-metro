@@ -21,7 +21,7 @@ const HOTSPOTS := [
 	["电脑", Rect2(158, 176, 23, 18), Vector2(802, 571), "news"],
 	["休息存档", Rect2(182, 185, 62, 10), Vector2(984, 571), "rest"],
 ]
-const LOOT_SPOTS := [Vector2(114, 348), Vector2(266, 380), Vector2(400, 335), Vector2(563, 397), Vector2(681, 335)]
+const LOOT_SPOTS := [Vector2(114, 348), Vector2(266, 380), Vector2(400, 335), Vector2(563, 397), Vector2(681, 335), Vector2(710, 455)]
 const RADIATION := ["", "低", "中", "高"]
 
 var state := State.new()
@@ -551,7 +551,7 @@ func show_trade(message: String = "") -> void:
 	scroll.add_child(rows)
 	for entry in state.inventory:
 		var kind: String = entry.kind
-		var offer := state.market_offer("demand", kind)
+		var offer := state.market_offer("demand", kind, state.station, int(entry.get("charge", State.FULL_CHARGE)))
 		var item_row := Control.new()
 		item_row.mouse_filter = Control.MOUSE_FILTER_IGNORE
 		item_row.custom_minimum_size.y = 57
@@ -560,11 +560,13 @@ func show_trade(message: String = "") -> void:
 		var detail := "本站不收" if offer.is_empty() else "今日已满额"
 		if not offer.is_empty() and offer.remaining > 0:
 			detail = "今日还能收 %d 件" % offer.remaining
-			action(item_row, "出售  %s 度" % str(offer.price), Rect2(267, 7, 174, 40), sell_item.bind(entry.id))
-		elif not State.Markets.ESSENTIALS.has(kind):
+			action(item_row, "出售  %s 度" % energy_text(offer.price), Rect2(267, 7, 174, 40), sell_item.bind(entry.id))
+		elif kind == "aaa" or not State.Markets.ESSENTIALS.has(kind):
 			action(item_row, "查附近买家", Rect2(267, 7, 174, 40), find_buyer.bind(kind))
 		else:
-			detail = "电量 %d%%" % entry.charge if kind == "aaa" else "每日补给"
+			detail = "每日补给"
+		if kind == "aaa":
+			detail = "电量 %d%% · %s" % [entry.charge, detail]
 		label(item_row, "%s · %s" % [state.rarity_name(kind), detail], Rect2(0, 28, 255, 20), 13, MUTED)
 
 func set_trade_supplies(enabled: bool) -> void:
@@ -693,10 +695,11 @@ func show_map_market(detail: Control, location: String) -> void:
 	quotes.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
 	put(detail, quotes, Rect2(20, 210, 277, 119))
 	var columns := Control.new()
-	columns.custom_minimum_size = Vector2(262, 24 + maxi(market.stock.size(), market.demand.size()) * 22)
+	var demand := State.Markets.demand(location)
+	columns.custom_minimum_size = Vector2(262, 24 + maxi(market.stock.size(), demand.size()) * 22)
 	quotes.add_child(columns)
 	map_quote_column(columns, location, market.stock, "stock", 0, "本站供应 / 度", "售罄")
-	map_quote_column(columns, location, market.demand, "demand", 132, "本站收购 / 度", "满额")
+	map_quote_column(columns, location, demand, "demand", 132, "本站收购 / 度", "满额")
 
 func map_quote_column(detail: Control, location: String, items: Dictionary, side: String, x: float, title: String, exhausted: String) -> void:
 	label(detail, title, Rect2(x, 0, 130, 21), 13, MUTED)
@@ -705,7 +708,10 @@ func map_quote_column(detail: Control, location: String, items: Dictionary, side
 		var offer := state.market_offer(side, kind, location)
 		var y := 22 + row * 22
 		label(detail, state.item_name(kind), Rect2(x, y, 81, 20), 12, state.rarity_color(kind))
-		var price := str(offer.price) if offer.remaining > 0 else exhausted
+		var price := energy_text(offer.price) if offer.remaining > 0 else exhausted
+		if side == "demand" and kind == "aaa" and offer.remaining > 0:
+			var empty := state.market_offer(side, kind, location, 0)
+			price = "%s–%s" % [energy_text(empty.price), price]
 		label(detail, price, Rect2(x + 81, y, 49, 20), 12, TEXT if offer.remaining > 0 else MUTED, HORIZONTAL_ALIGNMENT_RIGHT)
 		row += 1
 
