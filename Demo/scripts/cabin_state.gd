@@ -1,6 +1,8 @@
 extends "res://scripts/state.gd"
 
 const Markets = preload("res://scripts/cabin_markets.gd")
+const Rail = preload("res://scripts/cabin_map.gd")
+const AutoRepair = preload("res://scripts/auto_repair.gd")
 const START_STATION := "邮电新村"
 const SMALL := Vector2i(5, 4)
 const LARGE := Vector2i(6, 5)
@@ -11,12 +13,15 @@ const FOOTPRINTS := {
 	"circuit": Vector2i(2, 1), "powercore": Vector2i(3, 2),
 	"relic": Vector2i(2, 2),
 	"aaa": Vector2i.ONE, "water": Vector2i.ONE, "ration": Vector2i.ONE,
+	"tire": Vector2i(2, 2), "bolts": Vector2i.ONE, "steel_plate": Vector2i(3, 1),
+	"car_battery": Vector2i(2, 2), "engine": Vector2i(3, 2),
 }
 const SUPPLY_NAMES := {"aaa": "七号电池", "water": "饮用水", "ration": "口粮"}
 const RARITY := {
 	"book": 0, "copper": 0, "tools": 1,
 	"meds": 2, "circuit": 2, "relic": 2, "powercore": 3,
 	"aaa": 0, "water": 0, "ration": 0,
+	"tire": 0, "bolts": 0, "steel_plate": 1, "car_battery": 2, "engine": 3,
 }
 const RARITY_NAMES := ["普通", "少见", "稀有", "珍稀"]
 const RARITY_COLORS := [Color("bfc3ce"), Color("e4be76"), Color("ffa271"), Color("ff7873")]
@@ -30,9 +35,9 @@ const TRAVEL_COST_PER_STOP := 30
 const BATTERY_FILL_COST := 2.0
 const COMPUTER_DAILY_COST := 2.0
 const FULL_CHARGE := 100
-const PICKUP_CHARGE := 50
+const FLASHLIGHT_DRAIN_PER_SECOND := 5.0
 const NO_CELL := -1
-const PICKUP_TIME_MS := 5000
+const TRIP_LIMIT_SECONDS := 90
 const BLACKOUT_INTERVAL := 5
 
 var station := START_STATION
@@ -43,6 +48,8 @@ var gear: Dictionary = {}
 var next_id := 1
 var market_usage: Dictionary = {}
 var installed_charge := FULL_CHARGE
+var flashlight_on := false
+var flashlight_drain := 0.0
 var trip_deadline_ms := 0
 var debt := 0.0
 var days_in_debt := 0
@@ -55,6 +62,8 @@ var car_power := CAR_START_POWER
 var world_seed := randi()
 var charger_used: Dictionary = {}
 var trip_loot: Array[String] = []
+var trip_loot_station := ""
+var auto_repair_level := 0
 
 func _init() -> void:
 	account = ACCOUNT_START_POWER
@@ -117,8 +126,29 @@ func travel_to(destination: String, steps: int) -> bool:
 	station = destination
 	return true
 
+func extraction_cost(destination: String) -> int:
+	var route := Rail.route(station, destination)
+	return -1 if route.is_empty() else (route.size() - 1) * TRAVEL_COST_PER_STOP
+
+func extract_at(destination: String) -> String:
+	if not trip_active or remaining_ms() == 0:
+		return "外出时间已用完。"
+	var cost := extraction_cost(destination)
+	if cost < 0:
+		return "车厢无法抵达这个站点。"
+	if car_power < cost:
+		return "车电不足。接应需要 %d 度，当前有 %s 度。" % [cost, str(snappedf(car_power, 0.1))]
+	car_power -= cost
+	station = destination
+	end_trip()
+	return ""
+
 func item_name(kind: String) -> String:
-	return SUPPLY_NAMES[kind] if SUPPLY_NAMES.has(kind) else ITEMS[kind].name
+	if SUPPLY_NAMES.has(kind):
+		return SUPPLY_NAMES[kind]
+	if AutoRepair.PART_NAMES.has(kind):
+		return AutoRepair.PART_NAMES[kind]
+	return ITEMS[kind].name
 
 func rarity_name(kind: String) -> String:
 	return RARITY_NAMES[RARITY[kind]]
@@ -130,9 +160,16 @@ func bag_size() -> Vector2i:
 	return LARGE if wide_bag else SMALL
 
 func entries(container: String) -> Array[Dictionary]:
+	if container == "battery":
+		var slot: Array[Dictionary] = []
+		if installed_charge != NO_CELL:
+			slot.append({"id": NO_CELL, "kind": "aaa", "x": 0, "y": 0, "rotated": false, "charge": installed_charge})
+		return slot
 	return locker if container == "locker" else inventory
 
 func grid_size(container: String) -> Vector2i:
+	if container == "battery":
+		return Vector2i.ONE
 	return LOCKER if container == "locker" else bag_size()
 
 func footprint(kind: String, rotated: bool = false) -> Vector2i:
@@ -165,15 +202,17 @@ func fits(cargo: Array[Dictionary], bounds: Vector2i, box: Rect2i, ignore_id: in
 func ground_kind(slot: int) -> String:
 	if slot < 0 or slot >= trip_loot.size() or not trip_active:
 		return ""
-	if slot in collected.get(station, []):
+	if slot in collected.get(trip_loot_station, []):
 		return ""
 	return trip_loot[slot]
 
-func roll_loot(danger: int, crowbar: bool) -> Array[String]:
+func roll_loot(danger: int, crowbar: bool, location: String = "") -> Array[String]:
+	if location.is_empty():
+		location = station
 	var rare_chance := 12 + 6 * danger
-	var medical := station_roll(station, "medical", 99) < rare_chance
-	var circuit := station_roll(station, "circuit", 99) < rare_chance
-	var powercore := danger >= 3 and crowbar and station_roll(station, "powercore", 99) < 12
+	var medical := station_roll(location, "medical", 99) < rare_chance
+	var circuit := station_roll(location, "circuit", 99) < rare_chance
+	var powercore := danger >= 3 and crowbar and station_roll(location, "powercore", 99) < 12
 	return ["copper", "tools", "meds" if medical else "book", "powercore" if powercore else "", "circuit" if circuit else ""]
 
 func picked(container: String, id: int) -> Dictionary:
@@ -183,14 +222,18 @@ func picked(container: String, id: int) -> Dictionary:
 	return find_entry(container, id)
 
 func can_place(selection: Dictionary, target: String, cell: Vector2i) -> bool:
-	if target not in ["bag", "locker"] or trip_active and target == "locker":
+	if target not in ["bag", "locker", "battery"] or trip_active and target == "locker":
 		return false
 	var source: String = selection.source
-	if source == "ground" and not pickup_problem().is_empty():
+	if source == "ground" and remaining_ms() == 0:
 		return false
 	var id: int = selection.id
 	var entry := picked(source, id)
 	if entry.is_empty():
+		return false
+	if target == "battery":
+		return source == "bag" and entry.kind == "aaa" and cell == Vector2i.ZERO
+	if source == "battery" and target != "bag":
 		return false
 	var rect := Rect2i(cell, footprint(entry.kind, selection.rotated))
 	return fits(entries(target), grid_size(target), rect, id if source == target else -1)
@@ -201,13 +244,21 @@ func place(selection: Dictionary, target: String, cell: Vector2i) -> bool:
 	var source: String = selection.source
 	var id: int = selection.id
 	var entry := picked(source, id)
+	if target == "battery":
+		install_battery(entry)
+		return true
+	if source == "battery":
+		var spare := make_entry("aaa", cell, false)
+		spare.charge = installed_charge
+		inventory.append(spare)
+		installed_charge = NO_CELL
+		flashlight_on = false
+		return true
 	if source == "ground":
-		if not collected.has(station):
-			collected[station] = []
-		collected[station].append(id)
+		if not collected.has(trip_loot_station):
+			collected[trip_loot_station] = []
+		collected[trip_loot_station].append(id)
 		entry = make_entry(entry.kind, cell, selection.rotated)
-		installed_charge -= PICKUP_CHARGE
-		trip_deadline_ms -= PICKUP_TIME_MS
 	elif source != target:
 		entries(source).erase(entry)
 	if source != target:
@@ -229,6 +280,43 @@ func used_cells(container: String) -> int:
 	for entry in entries(container):
 		occupied += item_rect(entry).get_area()
 	return occupied
+
+func enroll_auto_repair(level: int) -> String:
+	if station != AutoRepair.STATION or trip_active or not game_over_reason.is_empty():
+		return "请到同济大学站的培训点报名。"
+	if level < 1 or level > AutoRepair.COURSES.size() or level != auto_repair_level + 1:
+		return "请按顺序报名尚未学过的课程。"
+	var fee: int = AutoRepair.COURSES[level - 1].fee
+	if account < fee:
+		return "报名需要 %d 度账户余额。" % fee
+	account -= fee
+	auto_repair_level = level
+	return ""
+
+func toggle_wrench() -> void:
+	if trip_active and gear.get("wrench", false):
+		gear.wrench_equipped = not gear.wrench_equipped
+
+func vehicle_part_taken(vehicle_id: String, kind: String) -> bool:
+	return kind in collected.get("vehicle/" + vehicle_id, [])
+
+func salvage_vehicle_part(vehicle_id: String, kind: String) -> String:
+	if not trip_active or remaining_ms() == 0:
+		return "外出时间已用完。"
+	if not gear.get("wrench_equipped", false):
+		return "需要装备扳手。"
+	var level := AutoRepair.required_level(kind)
+	if level == 0 or auto_repair_level < level:
+		return "尚未掌握这项拆解。"
+	if vehicle_part_taken(vehicle_id, kind):
+		return "这辆车上的该零件已经拆过。"
+	if not add_supply(kind, "bag"):
+		return "背包没有合适的空位。"
+	var vehicle_key := "vehicle/" + vehicle_id
+	var taken: Array = collected.get(vehicle_key, [])
+	taken.append(kind)
+	collected[vehicle_key] = taken
+	return ""
 
 func market_offer(side: String, kind: String, location: String = "") -> Dictionary:
 	var market_station := station if location.is_empty() else location
@@ -288,7 +376,7 @@ func purchase(kind: String) -> String:
 	record_trade("stock", kind)
 	return ""
 
-func add_supply(kind: String, container: String) -> bool:
+func first_free_placement(kind: String, container: String) -> Dictionary:
 	var bounds := grid_size(container)
 	var cargo := entries(container)
 	for rotated in [false, true]:
@@ -297,9 +385,24 @@ func add_supply(kind: String, container: String) -> bool:
 			for x in range(bounds.x):
 				var cell := Vector2i(x, y)
 				if fits(cargo, bounds, Rect2i(cell, shape)):
-					cargo.append(make_entry(kind, cell, rotated))
-					return true
-	return false
+					return {"cell": cell, "rotated": rotated}
+	return {}
+
+func add_supply(kind: String, container: String) -> bool:
+	var placement := first_free_placement(kind, container)
+	if placement.is_empty():
+		return false
+	entries(container).append(make_entry(kind, placement.cell, placement.rotated))
+	return true
+
+func pick_up_ground(slot: int) -> bool:
+	var kind := ground_kind(slot)
+	if kind.is_empty() or remaining_ms() == 0:
+		return false
+	var placement := first_free_placement(kind, "bag")
+	if placement.is_empty():
+		return false
+	return place({"source": "ground", "id": slot, "rotated": placement.rotated}, "bag", placement.cell)
 
 func give_starter_supplies() -> void:
 	for kind in ["aaa", "water", "ration"]:
@@ -333,13 +436,13 @@ func consume_supply(kind: String) -> String:
 func usable_spares() -> int:
 	var count := 0
 	for entry in inventory:
-		if entry.kind == "aaa" and entry.charge >= PICKUP_CHARGE:
+		if entry.kind == "aaa" and entry.charge > 0:
 			count += 1
 	return count
 
 func spare_battery() -> Dictionary:
 	var best: Dictionary = {}
-	var charge_to_beat := maxi(installed_charge, PICKUP_CHARGE - 1)
+	var charge_to_beat := maxi(installed_charge, 0)
 	for entry in inventory:
 		if entry.kind == "aaa" and entry.charge > charge_to_beat:
 			best = entry
@@ -350,13 +453,37 @@ func replace_battery() -> String:
 	var entry := spare_battery()
 	if entry.is_empty():
 		return "背包里没有电量更高的可用七号电池。"
+	install_battery(entry)
+	return ""
+
+func install_battery(entry: Dictionary) -> void:
 	var replacement: int = entry.charge
 	if installed_charge == NO_CELL:
 		inventory.erase(entry)
 	else:
 		entry.charge = installed_charge
 	installed_charge = replacement
+	if installed_charge == 0:
+		flashlight_on = false
+
+func toggle_flashlight() -> String:
+	if not trip_active or remaining_ms() == 0:
+		return "外出时间已用完。"
+	if installed_charge <= 0:
+		return "手电筒没有电，请装入有电的七号电池。"
+	flashlight_on = not flashlight_on
 	return ""
+
+func tick_flashlight(delta: float) -> void:
+	if not trip_active or not flashlight_on:
+		return
+	flashlight_drain += delta * FLASHLIGHT_DRAIN_PER_SECOND
+	var spent := mini(floori(flashlight_drain + 0.000001), installed_charge)
+	flashlight_drain = maxf(0.0, flashlight_drain - spent)
+	installed_charge -= spent
+	if installed_charge == 0:
+		flashlight_on = false
+		flashlight_drain = 0.0
 
 func battery_fill_cost(charge_level: int) -> float:
 	if charge_level == NO_CELL:
@@ -390,24 +517,15 @@ func overnight_power() -> float:
 	return maxf(0.0, car_power - COMPUTER_DAILY_COST)
 
 func trip_limit() -> int:
-	var month: int = Time.get_datetime_dict_from_unix_time(date_unix()).month
-	var forecast := weather()
-	return 20 if "雨" in forecast or (forecast == "晴" and month in [6, 7, 8]) else 30
+	return TRIP_LIMIT_SECONDS
 
 func remaining_ms() -> int:
 	return maxi(0, trip_deadline_ms - Time.get_ticks_msec()) if trip_active else 0
 
-func pickup_problem() -> String:
-	if not trip_active or remaining_ms() == 0:
-		return "外出时间已用完。"
-	if installed_charge < PICKUP_CHARGE:
-		return "手电筒电量不足，换上有电的七号电池后再拾取。"
-	return ""
-
 func suit_rent(heavy: bool) -> int:
 	return 50 if heavy else 30
 
-func depart(loadout: Dictionary, radiation: int) -> String:
+func depart(loadout: Dictionary, radiation: int, loot_station: String = "") -> String:
 	if trip_active or not game_over_reason.is_empty():
 		return "已经出发。"
 	if not loadout.get("light", false) or installed_charge <= 0:
@@ -420,7 +538,13 @@ func depart(loadout: Dictionary, radiation: int) -> String:
 			return "有物品超出所选背包的边界，请先在柜子里整理。"
 	spend_or_owe(suit_rent(loadout.heavy))
 	gear = loadout.duplicate()
-	trip_loot = roll_loot(radiation, gear.crowbar)
+	gear.wrench = auto_repair_level > 0 and loadout.get("wrench", false)
+	gear.wrench_equipped = gear.wrench
+	trip_loot_station = station if loot_station.is_empty() else loot_station
+	var loot_radiation: int = radiation if loot_station.is_empty() else Rail.station_info(loot_station).radiation
+	trip_loot = roll_loot(loot_radiation, gear.crowbar, trip_loot_station)
+	if not loot_station.is_empty():
+		trip_loot.append_array(["book", "copper", "tools", "book"])
 	wide_bag = loadout.wide
 	trip_active = true
 	trip_deadline_ms = Time.get_ticks_msec() + trip_limit() * 1000
@@ -428,9 +552,11 @@ func depart(loadout: Dictionary, radiation: int) -> String:
 
 func end_trip() -> void:
 	trip_active = false
+	flashlight_on = false
 	trip_deadline_ms = 0
 	gear.clear()
 	trip_loot.clear()
+	trip_loot_station = ""
 
 func fail_trip() -> int:
 	if not trip_active:
@@ -439,6 +565,7 @@ func fail_trip() -> int:
 	spend_or_owe(fee)
 	inventory.clear()
 	installed_charge = NO_CELL
+	flashlight_drain = 0.0
 	end_trip()
 	return fee
 
@@ -492,6 +619,7 @@ func save_data() -> Dictionary:
 		"days_without_food": days_without_food, "drank_today": drank_today,
 		"ate_today": ate_today, "game_over_reason": game_over_reason,
 		"car_power": car_power, "world_seed": world_seed, "charger_used": charger_used,
+		"auto_repair_level": auto_repair_level,
 	}
 
 func write_save(path: String, data: Dictionary) -> Error:
@@ -560,6 +688,8 @@ func load_cabin(path: String, known_stations: Array) -> bool:
 		return false
 	if version == CABIN_SAVE_VERSION and not valid_car_state(data):
 		return false
+	if not valid_index(data.get("auto_repair_level", 0), 0, AutoRepair.COURSES.size()):
+		return false
 	var needs_upgrade: bool = version == 1
 	if not needs_upgrade and not valid_vitals(data):
 		return false
@@ -585,6 +715,7 @@ func load_cabin(path: String, known_stations: Array) -> bool:
 	wide_bag = data.wide
 	account = balance
 	day = int(data.day)
+	auto_repair_level = int(data.get("auto_repair_level", 0))
 	if version == CABIN_SAVE_VERSION:
 		car_power = float(data.car_power)
 		world_seed = int(data.world_seed)
@@ -596,6 +727,7 @@ func load_cabin(path: String, known_stations: Array) -> bool:
 	end_trip()
 	collected.clear()
 	market_usage.clear()
+	flashlight_drain = 0.0
 	restore_vitals({} if needs_upgrade else data)
 	if needs_upgrade:
 		give_starter_supplies()

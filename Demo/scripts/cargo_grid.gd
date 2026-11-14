@@ -86,7 +86,7 @@ func _draw() -> void:
 		draw_rect(rect, tint.darkened(0.72))
 		draw_rect(rect, tint if active else tint.darkened(0.22), false, 2)
 		draw_rect(Rect2(rect.position + Vector2(4, 4), Vector2(rect.size.x - 8, 3)), tint)
-		var short_name: String = {"copper": "铜线", "tools": "工具", "book": "手册", "meds": "医疗", "circuit": "电路", "powercore": "电源", "relic": "相机", "aaa": "电池", "water": "饮水", "ration": "口粮"}[entry.kind]
+		var short_name: String = {"copper": "铜线", "tools": "工具", "book": "手册", "meds": "医疗", "circuit": "电路", "powercore": "电源", "relic": "相机", "aaa": "电池", "water": "饮水", "ration": "口粮", "car_battery": "车电池"}.get(entry.kind, host.state.item_name(entry.kind))
 		var title: String = host.state.item_name(entry.kind) if box.size.x >= 2 else short_name
 		draw_string(host.font, rect.position + Vector2(7, 28), title, HORIZONTAL_ALIGNMENT_LEFT, -1, 15, Color("f0ebdf"))
 		if entry.kind == "aaa":

@@ -3,6 +3,9 @@ extends Control
 const State = preload("res://scripts/cabin_state.gd")
 const Rail = preload("res://scripts/cabin_map.gd")
 const CargoGrid = preload("res://scripts/cargo_grid.gd")
+const SurfaceBlock = preload("res://scripts/surface_block.gd")
+const SurfaceMinimap = preload("res://scripts/surface_minimap.gd")
+const AutoRepair = preload("res://scripts/auto_repair.gd")
 const CABIN = preload("res://art/cabin.png")
 
 const TEXT := Color("f2eadd")
@@ -35,6 +38,15 @@ var trade_supplies := false
 var loadout: Dictionary = {}
 var save_path: String
 var pointer_position := Vector2.ZERO
+var surface_block: SurfaceBlock
+var surface_pack: Control
+var surface_location: Label
+var surface_prompt: Label
+var flashlight_button: Button
+var battery_panel: Control
+var battery_slot_open := false
+var wrench_button: Button
+var vehicle_panel: Control
 
 func _ready() -> void:
 	font = SystemFont.new()
@@ -56,9 +68,17 @@ func _ready() -> void:
 	else:
 		show_cabin("读取存档失败，已开始新游戏。" if has_save and not loaded else "")
 
-func _process(_delta: float) -> void:
+func _process(delta: float) -> void:
 	if screen == "surface" and not check_trip_timeout():
 		update_trip_clock()
+		var charge := state.installed_charge
+		var was_lit := state.flashlight_on
+		state.tick_flashlight(delta)
+		if was_lit != state.flashlight_on:
+			refresh_surface_light()
+			report("手电筒电池已耗尽。")
+		elif charge != state.installed_charge:
+			refresh_equipment()
 
 func _input(event: InputEvent) -> void:
 	if event is InputEventMouse:
@@ -73,6 +93,16 @@ func _input(event: InputEvent) -> void:
 	if event.keycode == KEY_F11:
 		var window := get_window()
 		window.mode = Window.MODE_MAXIMIZED if window.mode == Window.MODE_FULLSCREEN else Window.MODE_FULLSCREEN
+	elif event.physical_keycode == KEY_E and screen == "surface" and is_instance_valid(surface_block):
+		if not check_trip_timeout() and not is_instance_valid(vehicle_panel):
+			surface_block.interact()
+	elif event.physical_keycode in [KEY_1, KEY_KP_1] and screen == "surface":
+		if not check_trip_timeout():
+			var problem := state.toggle_flashlight()
+			refresh_surface_light()
+			report(problem)
+	elif event.keycode == KEY_ESCAPE and is_instance_valid(vehicle_panel):
+		close_vehicle()
 	elif event.keycode == KEY_ESCAPE and not selection.is_empty():
 		clear_selection()
 	elif event.keycode == KEY_R and not selection.is_empty():
@@ -165,6 +195,10 @@ func begin_page(kind: String) -> void:
 	if is_instance_valid(view):
 		view.hide()
 		view.queue_free()
+	if kind != "surface":
+		surface_block = null
+		battery_slot_open = false
+		vehicle_panel = null
 	screen = kind
 	selection = {}
 	grids.clear()
@@ -211,10 +245,12 @@ func show_cabin(message: String = "") -> void:
 	action(view, "充电站" if has_charger else "找充电站", Rect2(432, 163, 126, 33),
 		show_charger.bind("") if has_charger else find_charger)
 	action(view, "电池充电", Rect2(570, 163, 126, 33), show_battery_charger.bind(""))
+	var skill_caption := "汽修培训" if state.station == AutoRepair.STATION else "技能"
+	action(view, skill_caption, Rect2(710, 163, 126, 33), show_skills.bind(""), state.station == AutoRepair.STATION)
 	if state.is_blackout():
-		label(view, "今日停电", Rect2(710, 163, 105, 33), 16, AMBER)
+		label(view, "今日停电", Rect2(848, 163, 92, 33), 15, AMBER)
 	if state.debt > 0.0:
-		label(view, "待还欠费  %s 度" % energy_text(state.debt), Rect2(826, 163, 294, 33), 16, AMBER, HORIZONTAL_ALIGNMENT_RIGHT)
+		label(view, "待还欠费  %s 度" % energy_text(state.debt), Rect2(946, 163, 174, 33), 16, AMBER, HORIZONTAL_ALIGNMENT_RIGHT)
 	label(view, "%s\n%s\n%s" % [state.station, state.date_text(), state.weather()],
 		Rect2(268, 300, 100, 73), 13, Color("322d3d"), HORIZONTAL_ALIGNMENT_CENTER)
 	for spot in HOTSPOTS:
@@ -235,6 +271,48 @@ func use_supply(kind: String) -> void:
 	var success := "今日已喝水。" if kind == "water" else "今日已进食。"
 	show_cabin(success if problem.is_empty() else problem)
 
+func show_skills(message: String = "") -> void:
+	begin_page("skills")
+	var panel := modal("技能树", Rect2(168, 94, 944, 530))
+	var at_school := state.station == AutoRepair.STATION
+	label(panel, "同济大学站 · 汽修培训", Rect2(24, 81, 470, 30), 18, MINT)
+	label(panel, "账户余额 %s 度" % energy_text(state.account), Rect2(575, 81, 345, 30), 17, AMBER, HORIZONTAL_ALIGNMENT_RIGHT)
+	for branch in range(4):
+		var x := 24 + branch * 226
+		var active := branch == 0
+		plate(panel, Rect2(x, 124, 218, 44), Color("3e334c") if active else Color("292738"), AMBER if active else BORDER)
+		if active:
+			label(panel, "汽修  ·  %d 级" % state.auto_repair_level, Rect2(x, 124, 218, 44), 19, AMBER, HORIZONTAL_ALIGNMENT_CENTER)
+		for index in range(AutoRepair.COURSES.size()):
+			var level := index + 1
+			var y := 181 + index * 91
+			var learned := active and level <= state.auto_repair_level
+			var available := active and level == state.auto_repair_level + 1
+			var edge := MINT if learned else AMBER if available else BORDER
+			plate(panel, Rect2(x + 108, y - 13, 2, 13), edge)
+			plate(panel, Rect2(x, y, 218, 78), Color("322a40") if active else Color("292738"), edge)
+			if not active:
+				continue
+			var course: Dictionary = AutoRepair.COURSES[index]
+			label(panel, "%d 级 · %s" % [level, course.name], Rect2(x + 10, y + 3, 198, 24), 15, MINT if learned else TEXT)
+			label(panel, AutoRepair.course_parts(course), Rect2(x + 10, y + 28, 198, 21), 13, MUTED)
+			if available and at_school:
+				var enroll := action(panel, "报名 · %d 度" % course.fee, Rect2(x + 10, y + 49, 198, 24), enroll_course.bind(level), true)
+				enroll.add_theme_font_size_override("font_size", 13)
+				enroll.disabled = state.account < course.fee
+			else:
+				var caption := "已掌握" if learned else "到同济大学站报名" if available else "需先学习上一级"
+				label(panel, caption, Rect2(x + 10, y + 50, 198, 22), 12, MINT if learned else MUTED)
+	status = label(panel, "", Rect2(24, 457, 896, 39), 16, AMBER)
+	report(message)
+
+func enroll_course(level: int) -> void:
+	var problem := state.enroll_auto_repair(level)
+	var message := "已掌握汽修 %d 级。" % level
+	if level == 1:
+		message += " 培训点已发放扳手，可在出站时携带。"
+	show_skills(message if problem.is_empty() else problem)
+
 func use_hotspot(kind: String) -> void:
 	match kind:
 		"locker": show_locker()
@@ -243,7 +321,7 @@ func use_hotspot(kind: String) -> void:
 			show_trade()
 		"rest": show_rest()
 		"gear":
-			loadout = {"heavy": false, "wide": state.wide_bag, "light": true, "crowbar": true}
+			loadout = {"heavy": false, "wide": state.wide_bag, "light": true, "crowbar": true, "wrench": state.auto_repair_level > 0}
 			show_gear()
 		"news":
 			selected_station = ""
@@ -270,7 +348,7 @@ func show_rules(message: String) -> void:
 	var panel := modal("简要规则", Rect2(302, 99, 676, 522), dismiss_rules)
 	var rules := [
 		["用电与欠费", "行车每站耗 %d 度，电脑每天耗 %d 度。充电、购物和租防护服时，余额不足可挂账。七号电池在车内充。" % [State.TRAVEL_COST_PER_STOP, State.COMPUTER_DAILY_COST]],
-		["限时拾取", "出站必带装有七号电池的手电筒。满电可拾取两件，每件扣 5 秒。阴天 30 秒，雨天和 6 至 8 月晴天 20 秒。"],
+		["限时探索", "每次出站限时 %d 秒。出站必带装有七号电池的手电筒，按 1 开关照明。" % state.trip_limit()],
 		["超时赔偿", "超时丢失随身物品。普通防护服赔偿 300 度，加强型 500 度，余额不足记作欠费。"],
 		["每日生存", "每天喝水、进食，睡觉时结算。连续两天未喝水或欠费、连续三天未进食都会结束本轮。"],
 	]
@@ -605,23 +683,30 @@ func show_map() -> void:
 
 func show_map_market(detail: Control, location: String) -> void:
 	var market := State.Markets.profile(location)
-	label(detail, market.facility, Rect2(20, 183, 277, 26), 16, MINT)
+	var facility: String = "学校 · 汽修培训" if location == AutoRepair.STATION else market.facility
+	label(detail, facility, Rect2(20, 183, 277, 26), 16, MINT)
 	if state.has_charger(location):
 		var stock := state.charger_stock(location)
 		var service := "充电站停电" if state.is_blackout() else "电站余 %s 度" % energy_text(stock)
 		label(detail, service, Rect2(181, 183, 116, 26), 13, MINT if stock > 0 else AMBER, HORIZONTAL_ALIGNMENT_RIGHT)
-	map_quote_column(detail, location, market.stock, "stock", 20, "本站供应 / 度", "售罄")
-	map_quote_column(detail, location, market.demand, "demand", 162, "本站收购 / 度", "满额")
+	var quotes := ScrollContainer.new()
+	quotes.horizontal_scroll_mode = ScrollContainer.SCROLL_MODE_DISABLED
+	put(detail, quotes, Rect2(20, 210, 277, 119))
+	var columns := Control.new()
+	columns.custom_minimum_size = Vector2(262, 24 + maxi(market.stock.size(), market.demand.size()) * 22)
+	quotes.add_child(columns)
+	map_quote_column(columns, location, market.stock, "stock", 0, "本站供应 / 度", "售罄")
+	map_quote_column(columns, location, market.demand, "demand", 132, "本站收购 / 度", "满额")
 
 func map_quote_column(detail: Control, location: String, items: Dictionary, side: String, x: float, title: String, exhausted: String) -> void:
-	label(detail, title, Rect2(x, 210, 135, 21), 13, MUTED)
+	label(detail, title, Rect2(x, 0, 130, 21), 13, MUTED)
 	var row := 0
 	for kind in items:
 		var offer := state.market_offer(side, kind, location)
-		var y := 232 + row * 22
+		var y := 22 + row * 22
 		label(detail, state.item_name(kind), Rect2(x, y, 81, 20), 12, state.rarity_color(kind))
 		var price := str(offer.price) if offer.remaining > 0 else exhausted
-		label(detail, price, Rect2(x + 81, y, 54, 20), 12, TEXT if offer.remaining > 0 else MUTED, HORIZONTAL_ALIGNMENT_RIGHT)
+		label(detail, price, Rect2(x + 81, y, 49, 20), 12, TEXT if offer.remaining > 0 else MUTED, HORIZONTAL_ALIGNMENT_RIGHT)
 		row += 1
 
 func select_station(station: String) -> void:
@@ -671,11 +756,9 @@ func click_cell(target: String, cell: Vector2i) -> void:
 func select_cargo(source: String, id: int) -> void:
 	if check_trip_timeout():
 		return
-	if source == "ground":
-		var problem := state.pickup_problem()
-		if not problem.is_empty():
-			report(problem)
-			return
+	if source == "ground" and is_instance_valid(surface_block) and not surface_block.can_take(id):
+		report("走近物品后按 E 拾取。")
+		return
 	var entry := state.picked(source, id)
 	if entry.is_empty():
 		return
@@ -716,13 +799,20 @@ func move_cargo(target: String, cell: Vector2i) -> void:
 	if entry.is_empty():
 		clear_selection()
 		return
+	if selection.source == "ground" and is_instance_valid(surface_block) and not surface_block.can_take(selection.id):
+		clear_selection()
+		report("走近物品后按 E 拾取。")
+		return
 	if not state.place(selection, target, cell):
-		var problem := state.pickup_problem() if selection.source == "ground" else ""
-		report("放不下。试试空位、旋转，或重新摆放其他物品。" if problem.is_empty() else problem)
+		var problem := "放不下。试试空位、旋转，或重新摆放其他物品。"
+		if target == "battery":
+			problem = "从背包选择七号电池，再放入手电筒。"
+		report(problem)
 		return
 	if check_trip_timeout():
 		return
-	var message := "%s 已放入%s。" % [state.item_name(entry.kind), "柜子" if target == "locker" else "背包"]
+	var container_name: String = {"locker": "柜子", "bag": "背包", "battery": "手电筒"}[target]
+	var message := "%s 已放入%s。" % [state.item_name(entry.kind), container_name]
 	if screen == "locker":
 		show_locker(message)
 	else:
@@ -742,7 +832,11 @@ func show_gear(message: String = "") -> void:
 	label(panel, "手电筒必带 · %s" % installed_battery_text(), Rect2(360, 176, 263, 26), 17, MINT)
 	swap_button(panel, Rect2(360, 211, 263, 39))
 	action(panel, "撬棍   %s" % ("已携带" if loadout.crowbar else "未携带"), Rect2(360, 259, 263, 40), choose_gear.bind("crowbar", not loadout.crowbar), loadout.crowbar)
-	wrapped(panel, "一节满电电池可拾取两件物品。每件消耗半节电量和 5 秒。", Rect2(360, 310, 263, 63), 15, MUTED)
+	var carry_wrench: bool = loadout.get("wrench", false)
+	var wrench := action(panel, "扳手   %s" % ("已携带" if carry_wrench else "未携带"), Rect2(360, 309, 263, 40), choose_gear.bind("wrench", not carry_wrench), carry_wrench)
+	wrench.disabled = state.auto_repair_level == 0
+	wrench.tooltip_text = "完成同济大学汽修一级培训后获得。"
+	label(panel, "按 1 照明 · 每秒耗电 5%", Rect2(360, 353, 263, 24), 14, MUTED)
 	action(panel, "小背包    5 × 4", Rect2(692, 178, 263, 48), choose_gear.bind("wide", false), not loadout.wide)
 	action(panel, "大背包    6 × 5", Rect2(692, 236, 263, 48), choose_gear.bind("wide", true), loadout.wide)
 	wrapped(panel, "出发前可在柜子里腾出空间。", Rect2(692, 308, 263, 49), 15, MUTED)
@@ -781,7 +875,8 @@ func choose_gear(key: String, enabled: bool) -> void:
 
 func confirm_departure() -> void:
 	var previous_debt := state.debt
-	var problem := state.depart(loadout, Rail.station_info(state.station).radiation)
+	var loot_station := State.START_STATION if SurfaceBlock.supports(state.station) else ""
+	var problem := state.depart(loadout, Rail.station_info(state.station).radiation, loot_station)
 	if problem.is_empty():
 		var debt_note := added_debt_note(previous_debt)
 		show_surface("防护服已租用" + debt_note if not debt_note.is_empty() else "")
@@ -789,6 +884,128 @@ func confirm_departure() -> void:
 		report(problem)
 
 func show_surface(message: String = "") -> void:
+	if SurfaceBlock.supports(state.station):
+		show_exploration_block(message)
+	else:
+		show_legacy_surface(message)
+
+func show_exploration_block(message: String) -> void:
+	if not is_instance_valid(surface_block):
+		begin_page("surface")
+		overlay(view, Color("191827"))
+		surface_location = label(view, "", Rect2(40, 24, 770, 46), 32)
+		label(view, "%s站出发    /    车电 %s" % [state.station, car_power_text()], Rect2(43, 73, 560, 25), 16, MINT)
+		time_label = label(view, "", Rect2(1018, 32, 222, 41), 25, AMBER, HORIZONTAL_ALIGNMENT_RIGHT)
+		surface_block = SurfaceBlock.new()
+		surface_block.setup(state, font)
+		surface_block.pickup_requested.connect(pick_up_surface_item)
+		surface_block.extraction_requested.connect(extract_from_block)
+		surface_block.vehicle_requested.connect(show_vehicle)
+		var street_frame := Control.new()
+		street_frame.clip_contents = true
+		street_frame.mouse_filter = MOUSE_FILTER_IGNORE
+		put(view, street_frame, Rect2(40, 112, 777, 524))
+		put(street_frame, surface_block, Rect2(Vector2.ZERO, street_frame.size))
+		var map := SurfaceMinimap.new()
+		map.name = "Minimap"
+		map.setup(surface_block, font)
+		put(view, map, Rect2(550, 126, 250, 172))
+		surface_prompt = label(view, "", Rect2(56, 584, 745, 32), 17, AMBER)
+		status = label(view, "", Rect2(42, 647, 1190, 33), 16, AMBER)
+		surface_block.moved.connect(update_surface_position)
+	selection = {}
+	update_trip_clock()
+	update_surface_pack(true)
+	refresh_surface_light()
+	report(message)
+
+func pick_up_surface_item(slot: int) -> void:
+	if check_trip_timeout() or (is_instance_valid(surface_block) and not surface_block.can_take(slot)):
+		return
+	var kind := state.ground_kind(slot)
+	if kind.is_empty():
+		return
+	if not state.pick_up_ground(slot):
+		report("背包没有合适的空位。")
+		return
+	show_surface("已拾取%s，放入背包。" % state.item_name(kind))
+
+func close_vehicle() -> void:
+	if is_instance_valid(vehicle_panel):
+		vehicle_panel.hide()
+		vehicle_panel.queue_free()
+		vehicle_panel = null
+	if is_instance_valid(surface_block):
+		surface_block.inspecting_vehicle = false
+
+func show_vehicle(vehicle_id: String) -> void:
+	if check_trip_timeout() or surface_block.nearby_vehicle() != vehicle_id:
+		return
+	close_vehicle()
+	clear_selection()
+	surface_block.inspecting_vehicle = true
+	var frame := Panel.new()
+	frame.name = "VehicleParts"
+	frame.add_theme_stylebox_override("panel", style(DARK, AMBER))
+	put(view, frame, Rect2(170, 278, 489, 298))
+	vehicle_panel = frame
+	label(frame, "废弃汽车", Rect2(19, 12, 230, 31), 22)
+	var equipped: bool = state.gear.wrench_equipped
+	var caption := "汽修 %d 级 · 扳手已装备" % state.auto_repair_level if equipped else "汽修 %d 级 · 需要装备扳手" % state.auto_repair_level
+	label(frame, caption, Rect2(20, 43, 350, 23), 15, MINT if equipped else AMBER)
+	action(frame, "关闭", Rect2(406, 14, 64, 34), close_vehicle)
+	var y := 72
+	for course in AutoRepair.COURSES:
+		for kind in course.parts:
+			var required := AutoRepair.required_level(kind)
+			var taken := state.vehicle_part_taken(vehicle_id, kind)
+			var caption_right := "已拆除" if taken else "需汽修 %d 级" % required if state.auto_repair_level < required else "拆下并收纳"
+			var dimensions := state.footprint(kind)
+			plate(frame, Rect2(19, y, 451, 39), Color("2e283e"), BORDER)
+			label(frame, "%s   %d×%d 格" % [state.item_name(kind), dimensions.x, dimensions.y], Rect2(29, y, 250, 39), 15, state.rarity_color(kind) if not taken else MUTED)
+			var button := action(frame, caption_right, Rect2(315, y + 3, 148, 33), take_vehicle_part.bind(vehicle_id, kind))
+			button.disabled = not equipped or taken or state.auto_repair_level < required
+			y += 43
+
+func take_vehicle_part(vehicle_id: String, kind: String) -> void:
+	if check_trip_timeout() or surface_block.nearby_vehicle() != vehicle_id:
+		return
+	var problem := state.salvage_vehicle_part(vehicle_id, kind)
+	if not problem.is_empty():
+		report(problem)
+		return
+	show_exploration_block("")
+	show_vehicle(vehicle_id)
+	report("已拆下%s，放入背包。" % state.item_name(kind))
+
+func update_surface_position() -> void:
+	var cell: Vector2i = surface_block.cell()
+	var title: String = SurfaceBlock.CELL_NAMES[cell.y][cell.x]
+	var location: Dictionary = surface_block.active_building()
+	if not location.is_empty():
+		title = "%s · %d 楼" % [location.name, surface_block.floor_index + 1]
+	surface_location.text = title
+	var target: Dictionary = surface_block.interaction()
+	surface_prompt.text = "" if target.is_empty() else "[ E ]  " + target.caption
+	if not location.is_empty() and not state.flashlight_on and target.is_empty():
+		surface_prompt.text = "[ 1 ]  打开手电筒"
+	if selection.get("source") == "ground" and not surface_block.can_take(selection.id):
+		clear_selection()
+
+func extract_from_block(destination: String) -> void:
+	if check_trip_timeout():
+		return
+	var cost := state.extraction_cost(destination)
+	var problem := state.extract_at(destination)
+	if not problem.is_empty():
+		report(problem)
+		return
+	var message := "已返回 %s。" % destination
+	if cost > 0:
+		message = "已从%s站撤离 · 车厢接应耗电 %d 度" % [destination, cost]
+	show_cabin(message)
+
+func show_legacy_surface(message: String) -> void:
 	begin_page("surface")
 	overlay(view, Color("191827"))
 	label(view, "%s · 地表" % state.station, Rect2(40, 24, 560, 46), 34)
@@ -809,26 +1026,85 @@ func show_surface(message: String = "") -> void:
 		var tint := state.rarity_color(kind)
 		var prop := plate(landscape, Rect2(anchor - Vector2(14, -7), Vector2(28, 15)), tint, Color("211d29"))
 		plate(prop, Rect2(5, 3, 14, 3), tint.lightened(0.4))
-		var hotspot := action(landscape, name, Rect2(anchor - Vector2(68, 34), Vector2(136, 34)), select_cargo.bind("ground", id))
+		var hotspot := action(landscape, name, Rect2(anchor - Vector2(68, 34), Vector2(136, 34)), pick_up_surface_item.bind(id))
 		hotspot.tooltip_text = "%s · %d × %d 格" % [state.rarity_name(kind), dims.x, dims.y]
 		hotspot.add_theme_font_size_override("font_size", 14)
 		hotspot.add_theme_color_override("font_color", tint)
 		hotspot.set_drag_forwarding(ground_drag.bind(hotspot, id), Callable(), Callable())
-		var sprite_hit := invisible_action(landscape, prop.get_rect().grow(4), select_cargo.bind("ground", id))
+		var sprite_hit := invisible_action(landscape, prop.get_rect().grow(4), pick_up_surface_item.bind(id))
 		sprite_hit.tooltip_text = "%s · %s" % [name, hotspot.tooltip_text]
 		sprite_hit.set_drag_forwarding(ground_drag.bind(sprite_hit, id), Callable(), Callable())
-	var sidebar := plate(view, Rect2(836, 112, 404, 524), DARK, BORDER)
-	label(sidebar, cargo_title("bag"), Rect2(24, 17, 354, 33), 22)
-	add_grid(sidebar, "bag", Vector2(24, 67), 54)
-	var pickups := floori(state.installed_charge / float(State.PICKUP_CHARGE))
-	var light_color := MINT if pickups > 0 else AMBER
-	var light_text := "手电筒 %s" % installed_battery_text()
-	light_text += " · 还能拾取 %d 件" % pickups if pickups > 0 else " · 请更换电池"
-	label(sidebar, light_text, Rect2(24, 347, 354, 26), 16, light_color)
-	swap_button(sidebar, Rect2(24, 379, 354, 38))
-	wrapped(sidebar, "点选或拖动物品到背包格子。\n滚轮或 R 旋转，拾取扣 5 秒。", Rect2(24, 428, 352, 66), 15, MUTED)
+	update_surface_pack(false)
 	status = label(view, "", Rect2(42, 647, 1190, 33), 16, AMBER)
 	report(message)
+
+func update_surface_pack(walking: bool) -> void:
+	if is_instance_valid(surface_pack):
+		surface_pack.hide()
+		surface_pack.queue_free()
+	grids.clear()
+	var sidebar := plate(view, Rect2(836, 112, 404, 524), DARK, BORDER)
+	surface_pack = sidebar
+	label(sidebar, cargo_title("bag"), Rect2(24, 17, 354, 33), 22)
+	add_grid(sidebar, "bag", Vector2(24, 60), 48)
+	plate(sidebar, Rect2(24, 317, 356, 1), BORDER)
+	label(sidebar, "装备", Rect2(24, 323, 100, 28), 19)
+	var suit := plate(sidebar, Rect2(24, 358, 126, 44), Color("302b43"), BORDER)
+	label(suit, "加强防护服" if state.gear.heavy else "普通防护服", Rect2(0, 0, 126, 44), 15, TEXT, HORIZONTAL_ALIGNMENT_CENTER)
+	flashlight_button = action(sidebar, "", Rect2(160, 358, 220, 44), toggle_battery_slot)
+	flashlight_button.name = "Flashlight"
+	flashlight_button.focus_mode = Control.FOCUS_NONE
+	flashlight_button.tooltip_text = "点击打开电池槽。按 1 开关手电筒。"
+	battery_panel = plate(sidebar, Rect2(160, 409, 220, 61), Color("292539"), BORDER)
+	battery_panel.name = "BatterySlot"
+	add_grid(battery_panel, "battery", Vector2(7, 4), 52)
+	wrapped(battery_panel, "电池槽\n放入或取出七号电池", Rect2(68, 8, 145, 48), 14, MUTED)
+	battery_panel.visible = battery_slot_open
+	if walking:
+		wrench_button = action(sidebar, "", Rect2(24, 409, 126, 44), toggle_wrench)
+		wrench_button.name = "Wrench"
+		wrench_button.focus_mode = Control.FOCUS_NONE
+		wrench_button.disabled = not state.gear.wrench
+		wrench_button.tooltip_text = "点击装备或收起扳手。"
+	var instructions := "A / D 移动 · E 互动 · R 旋转 · 1 照明" if walking else "点击拾取或拖入背包 · R 旋转 · 1 照明"
+	label(sidebar, instructions, Rect2(24, 483, 356, 26), 14, MUTED)
+	refresh_equipment()
+
+func toggle_battery_slot() -> void:
+	battery_slot_open = not battery_slot_open
+	battery_panel.visible = battery_slot_open
+	if not battery_slot_open and selection.get("source") == "battery":
+		clear_selection()
+
+func toggle_wrench() -> void:
+	if check_trip_timeout():
+		return
+	state.toggle_wrench()
+	refresh_equipment()
+	if is_instance_valid(vehicle_panel):
+		show_vehicle(surface_block.nearby_vehicle())
+
+func refresh_equipment() -> void:
+	if not is_instance_valid(flashlight_button):
+		return
+	var caption := "手电筒 · %s · %s" % ["开" if state.flashlight_on else "关", installed_battery_text()]
+	flashlight_button.text = caption
+	flashlight_button.add_theme_color_override("font_color", MINT if state.flashlight_on else TEXT)
+	if is_instance_valid(wrench_button) and is_instance_valid(surface_block):
+		var equipped: bool = state.gear.wrench_equipped
+		var caption_wrench := "未携带" if not state.gear.wrench else "已装备" if equipped else "已收起"
+		wrench_button.text = "扳手 · " + caption_wrench
+		wrench_button.add_theme_color_override("font_color", MINT if equipped else TEXT)
+	for grid in grids:
+		if grid.container == "battery":
+			grid.queue_redraw()
+
+func refresh_surface_light() -> void:
+	refresh_equipment()
+	if is_instance_valid(surface_block):
+		surface_block.update_lighting()
+		surface_block.queue_redraw()
+		update_surface_position()
 
 func ground_drag(_at: Vector2, node: Control, id: int) -> Variant:
 	select_cargo("ground", id)

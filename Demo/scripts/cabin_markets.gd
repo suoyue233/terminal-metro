@@ -18,7 +18,11 @@ const PROFILES := {
 		"name": "维修站",
 		"facility": "维修间 · 设备修复",
 		"stock": {"tools": [52.0, 3]},
-		"demand": {"copper": [37.0, 4], "circuit": [119.0, 2], "powercore": [218.0, 1]},
+		"demand": {
+			"copper": [37.0, 4], "circuit": [119.0, 2], "powercore": [218.0, 1],
+			"tire": [18.0, 3], "bolts": [8.0, 5], "steel_plate": [36.0, 3],
+			"car_battery": [64.0, 2], "engine": [110.0, 1],
+		},
 	},
 	"clinic": {
 		"name": "医院物资窗口",
